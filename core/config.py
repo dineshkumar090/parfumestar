@@ -53,6 +53,11 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "perfumestar")
 # Semantic score threshold — skip note matching when Shopify match is this strong
 SHOPIFY_DIRECT_MATCH_THRESHOLD = float(os.getenv("SHOPIFY_DIRECT_MATCH_THRESHOLD", "0.78"))
 
+# Product sync (note extraction + embedding) makes 1-2 OpenAI calls per
+# product. Run this many concurrently instead of one-at-a-time — a 900-product
+# catalog otherwise takes 10-20+ minutes of sequential network round trips.
+SYNC_EMBED_CONCURRENCY = int(os.getenv("SYNC_EMBED_CONCURRENCY", "8"))
+
 # Pinecone always returns a nearest neighbor for top_k>=1 even when nothing is
 # actually relevant. Below this score, a query isn't treated as "about" that
 # international perfume unless the customer explicitly named a brand

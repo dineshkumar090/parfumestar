@@ -87,6 +87,78 @@ def migrate_products(engine: Engine) -> list[str]:
     return changed
 
 
+# Tables that store product / user / config text which can legitimately
+# contain 4-byte UTF-8 characters (emoji). Shopify product titles like
+# "🎁 Star 2454 - Lueur d'Espoir (100% off)" are the concrete trigger.
+UTF8MB4_TABLES = [
+    "products",
+    "main_database",
+    "perfume_notes",
+    "chatbot_configs",
+    "chat_threads",
+    "chat_messages",
+    "engagement_events",
+    "chat_intent_logs",
+    "custom_data",
+    "pages",
+    "blogs",
+    "blog_posts",
+    "product_details",
+    "message_evaluations",
+    "stores",
+    "store_configs",
+]
+
+
+def _table_charset(conn, table: str) -> str | None:
+    row = conn.execute(
+        text(
+            "SELECT CCSA.character_set_name "
+            "FROM information_schema.TABLES T "
+            "JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY CCSA "
+            "  ON CCSA.collation_name = T.table_collation "
+            "WHERE T.table_schema = DATABASE() AND T.table_name = :t"
+        ),
+        {"t": table},
+    ).fetchone()
+    return row[0] if row else None
+
+
+def migrate_utf8mb4(engine: Engine) -> list[str]:
+    """Convert product/text tables to utf8mb4 so 4-byte characters (emoji such
+    as 🎁 in Shopify product titles) can be stored. Without this MySQL raises
+    error 1366 "Incorrect string value" and every emoji product is skipped
+    from the sync.
+
+    Each table is converted in its own transaction and any failure (e.g. a
+    missing ALTER privilege, or an index-prefix limit on very old MySQL) is
+    logged and swallowed — one un-convertible table must never block startup
+    or the remaining conversions. Idempotent: tables already utf8mb4 are
+    skipped."""
+    existing = set(inspect(engine).get_table_names())
+    converted: list[str] = []
+
+    for table in UTF8MB4_TABLES:
+        if table not in existing:
+            continue
+        try:
+            with engine.begin() as conn:
+                if _table_charset(conn, table) == "utf8mb4":
+                    continue
+                conn.execute(
+                    text(
+                        f"ALTER TABLE `{table}` CONVERT TO CHARACTER SET utf8mb4 "
+                        f"COLLATE utf8mb4_unicode_ci"
+                    )
+                )
+            converted.append(table)
+            logger.info("Converted table %s to utf8mb4", table)
+        except Exception as e:
+            logger.error("utf8mb4 conversion failed for table %s: %s", table, e)
+
+    return converted
+
+
 def run_startup_migrations(engine: Engine) -> None:
     """Run all pending schema migrations."""
     try:
@@ -100,3 +172,9 @@ def run_startup_migrations(engine: Engine) -> None:
     except Exception as e:
         logger.error("Schema migration failed: %s", e)
         raise
+
+    # Charset conversion is self-guarding (per-table try/except) and must not
+    # be able to abort startup, so it runs outside the raising block above.
+    converted = migrate_utf8mb4(engine)
+    if converted:
+        logger.info("Migration complete — converted to utf8mb4: %s", ", ".join(converted))

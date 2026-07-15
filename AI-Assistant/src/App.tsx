@@ -11,15 +11,15 @@ import ProductSync from './components/ProductSync';
 import Conversations from './components/Conversations';
 // import OrdersSupport from './components/OrdersSupport';
 import AISettings from './components/AISettings';
-import ShopifyIntegration from './components/ShopifyIntegration';
-import LogsMonitoring from './components/LogsMonitoring';
+// import ShopifyIntegration from './components/ShopifyIntegration';
+// import LogsMonitoring from './components/LogsMonitoring';
 // import SecurityPrivacy from './components/SecurityPrivacy';
 import ConversationDetail from './components/ConversationDetail';
-import ChatWithBot from './components/ChatWithBot';
+// import ChatWithBot from './components/ChatWithBot';
 import SyncManager from './components/SyncManager';
-import CustomAIPages from './components/CustomAIPages';
-import EvaluationConversations from './components/EvaluationConversations';
-import EvaluationConversationDetail from './components/EvaluationConversationDetail';
+// import CustomAIPages from './components/CustomAIPages';
+// import EvaluationConversations from './components/EvaluationConversations';
+// import EvaluationConversationDetail from './components/EvaluationConversationDetail';
 import SyncSettings from './components/SyncSettings';
 import CustomAIContent from './components/CustomAIContent';
 import { HelpCircleIcon } from 'lucide-react';
@@ -89,9 +89,10 @@ function AppContent() {
         matcher={matcher}
       /> */}
 
-      <ui-nav-menu>
-  {/* rel="home" binds this link to your main app name click */}
-  <a href="/" rel="home">Dashboard</a>
+      
+<ui-nav-menu>
+  <a href="/" rel="home">Chatbot Control</a>
+  <a href="/dashboard">Dashboard</a>
   <a href="/product-sync">Product Sync</a>
   <a href="/conversations">Conversations</a>
   <a href="/ai-settings">API Configuration</a>
@@ -102,16 +103,26 @@ function AppContent() {
 
       {/* Your main content - no extra header */}
       <div style={{ minHeight: '100vh', backgroundColor: '#f6f6f7', padding: '20px' }}>
-        <Routes>
-  {/* Redirect root to /dashboard so the menu always expands */}
-  <Route path="/" element={<Navigate to="/dashboard" replace />} />
-  
-  {/* If ChatbotControl is a separate page, give it a specific path */}
-  <Route path="/chatbot-control" element={<ChatbotControl />} />
-  
+    <Routes>
+  {/* Home */}
+  <Route path="/" element={<ChatbotControl />} />
+
+  {/* Main navigation */}
   <Route path="/dashboard" element={<DashboardOverview />} />
   <Route path="/product-sync" element={<ProductSync />} />
-  {/* ... rest of your routes ... */}
+  <Route path="/conversations" element={<Conversations />} />
+  <Route path="/ai-settings" element={<AISettings />} />
+  <Route path="/sync-manager" element={<SyncManager />} />
+  <Route path="/custom-ai-content" element={<CustomAIContent />} />
+  <Route path="/sync-settings" element={<SyncSettings />} />
+
+  {/* Conversation details */}
+  <Route
+    path="/conversations/:threadUuid"
+    element={<ConversationDetail />}
+  />
+
+  <Route path="*" element={<ChatbotControl />} />
 </Routes>
         {/* <Routes>
           <Route path="/" element={<ChatbotControl />} />

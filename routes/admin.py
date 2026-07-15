@@ -962,7 +962,11 @@ def _run_shopify_sync_job(sync_log_id: int, shop: str):
 
         result = sync_shopify_products(db, shop, store)
 
-        sync_log.status = "success"
+        # A run that hit per-product errors still persisted everything else
+        # (savepoints isolate failures) — mark it "partial" so the admin sees
+        # that some products didn't make it, rather than a clean "success".
+        errors = result.get("errors", 0)
+        sync_log.status = "partial" if errors else "success"
         sync_log.total_products = result["total"]
         sync_log.active_products = db.query(Product).filter(
             Product.status == "active",
@@ -971,9 +975,10 @@ def _run_shopify_sync_job(sync_log_id: int, shop: str):
         sync_log.embedded_products = result["embedded"]
         sync_log.duration_seconds = round(time.time() - started_at, 2)
         sync_log.error_message = (
-            f"{result['updated']} updated, {result['skipped_unchanged']} unchanged (skipped), "
+            f"{result['total']} fetched, {result['updated']} updated, "
+            f"{result['skipped_unchanged']} unchanged (skipped), "
             f"{result['embedded']} embedded, {result['deactivated']} disabled, "
-            f"{result.get('purged', 0)} draft/archived removed"
+            f"{result.get('purged', 0)} draft/archived removed, {errors} errors"
         )
         db.commit()
     except Exception as exc:
@@ -1592,6 +1597,26 @@ def get_enabled_products_count(
         "enabled": enabled,
         "disabled": disabled
     }
+
+
+@router.get("/products/stats")
+def get_products_stats(shop: str = Query(...), db: Session = Depends(get_db)):
+    """Store-wide product counts for the dashboard cards. The old stat cards
+    were computed client-side from the current page of results (max pageSize
+    rows), so 'Active: 37' really meant '37 on the visible page' — very
+    misleading when the catalog has hundreds of products across many pages."""
+    store = get_store_config(db, shop)
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+
+    base = db.query(Product).filter(Product.shop_url == shop)
+    return {
+        "total": base.count(),
+        "active": base.filter(Product.status == "active").count(),
+        "draft": base.filter(Product.status == "draft").count(),
+        "enabled_in_ai": base.filter(Product.is_enabled == 1).count(),
+    }
+
 
 @router.get("/sync-pages")
 def sync_pages(shop: str, db: Session = Depends(get_db)):

@@ -1,9 +1,12 @@
+import logging
 import time
 
 import requests
 import re
 
 API_VERSION = "2024-01"
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def shopify_get_with_retry(url: str, headers: dict, timeout: int = 30, max_retries: int = 5):
@@ -39,9 +42,13 @@ def fetch_products(access_token: str, shop_url: str):
     shop_url = normalize_shop_url(shop_url)
 
     all_products = []
+    # No status/published_status filter → returns active, draft and archived
+    # products (the sync itself decides what to keep), 250 per page.
     url = f"https://{shop_url}/admin/api/{API_VERSION}/products.json?limit=250"
 
+    page = 0
     while url:
+        page += 1
         try:
             response = shopify_get_with_retry(
                 url,
@@ -50,23 +57,27 @@ def fetch_products(access_token: str, shop_url: str):
                     "Content-Type": "application/json"
                 },
             )
-
-            data = response.json()
-            products = data.get("products", [])
-            all_products.extend(products)
-
-            # 🔁 Pagination handling
-            link_header = response.headers.get("Link", "")
-            if 'rel="next"' in link_header:
-                match = re.search(r'<([^>]+)>; rel="next"', link_header)
-                url = match.group(1) if match else None
-            else:
-                url = None
-
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching products: {e}")
-            break
+            # Don't silently return a partial catalog — that would make the
+            # sync record a truncated product set as a "success". Surface it
+            # so the sync log shows an error and the run can be retried.
+            logger.error(
+                "[SHOPIFY] products fetch failed on page %s after %s products: %s",
+                page, len(all_products), e,
+            )
+            raise
 
+        data = response.json()
+        products = data.get("products", [])
+        all_products.extend(products)
+        logger.info("[SHOPIFY] products page %s: +%s (total %s)", page, len(products), len(all_products))
+
+        # 🔁 Pagination handling (Shopify cursor-based Link header)
+        link_header = response.headers.get("Link", "")
+        match = re.search(r'<([^>]+)>;\s*rel="next"', link_header)
+        url = match.group(1) if match else None
+
+    logger.info("[SHOPIFY] products fetch complete: %s products over %s page(s)", len(all_products), page)
     return all_products
 
 

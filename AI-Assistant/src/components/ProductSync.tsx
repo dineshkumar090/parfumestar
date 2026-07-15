@@ -662,6 +662,7 @@ export default function ProductSync() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [syncLogs, setSyncLogs] = useState<SyncLog[]>([]);
+  const [stats, setStats] = useState<{ total: number; active: number; draft: number; enabled_in_ai: number }>({ total: 0, active: 0, draft: 0, enabled_in_ai: 0 });
   const [filterStatus, setFilterStatus] = useState('all');
   const [filterEnabled, setFilterEnabled] = useState('all');
   const [selectedProducts, setSelectedProducts] = useState<Set<number>>(new Set());
@@ -708,7 +709,7 @@ export default function ProductSync() {
       if (filterEnabled !== 'all') url += `&enabled_filter=${filterEnabled}`;
       if (filterStatus !== 'all') url += `&status=${filterStatus}`;
 
-      const response = await fetchWithTimeout(url, 30000);
+      const response = await fetchWithTimeout(url, undefined, 30000);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
       const data = await response.json();
@@ -732,10 +733,30 @@ export default function ProductSync() {
 
   const fetchSyncLogs = useCallback(async () => {
     try {
-      const response = await fetchWithTimeout(`${API_BASE_URL}/api/sync-logs?shop=${SHOP}&limit=20`, 10000);
+      const response = await fetchWithTimeout(`${API_BASE_URL}/api/sync-logs?shop=${SHOP}&limit=20`, undefined, 10000);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       setSyncLogs(data.logs || []);
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }, []);
+
+  // Store-wide counts (not the current page slice). Without this the stat
+  // cards showed "37 Active" for a 900-product catalog — that 37 was just the
+  // active products on the visible page.
+  const fetchStats = useCallback(async () => {
+    try {
+      const response = await fetchWithTimeout(`${API_BASE_URL}/api/products/stats?shop=${SHOP}`, undefined, 10000);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      setStats({
+        total: data.total || 0,
+        active: data.active || 0,
+        draft: data.draft || 0,
+        enabled_in_ai: data.enabled_in_ai || 0,
+      });
       return true;
     } catch (err) {
       return false;
@@ -746,13 +767,13 @@ export default function ProductSync() {
     setLoading(true);
     setError(null);
     try {
-      await Promise.all([fetchProducts(), fetchSyncLogs()]);
+      await Promise.all([fetchProducts(), fetchSyncLogs(), fetchStats()]);
     } catch (err) {
       setError('Failed to load data. Please try again.');
     } finally {
       setLoading(false);
     }
-  }, [fetchProducts, fetchSyncLogs]);
+  }, [fetchProducts, fetchSyncLogs, fetchStats]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
@@ -789,6 +810,8 @@ export default function ProductSync() {
       const log = await pollSyncLog(data.sync_log_id);
       if (log.status === 'success') {
         showSuccess(log.error_message || 'Shopify products synced successfully!');
+      } else if (log.status === 'partial') {
+        setError(`Shopify sync completed with some errors: ${log.error_message || ''}. See Sync History.`);
       } else {
         setError(`Shopify sync failed: ${log.error_message || 'Unknown error'}`);
       }
@@ -812,6 +835,8 @@ export default function ProductSync() {
       const log = await pollSyncLog(data.sync_log_id);
       if (log.status === 'success') {
         showSuccess(log.error_message || 'Brand/International products synced successfully!');
+      } else if (log.status === 'partial') {
+        setError(`Brand/International sync completed with some errors: ${log.error_message || ''}. See Sync History.`);
       } else {
         setError(`Brand/International sync failed: ${log.error_message || 'Unknown error'}`);
       }
@@ -905,10 +930,11 @@ export default function ProductSync() {
     }
   };
 
-  const totalProducts = totalCount;
-  const enabledInAI = products.filter(p => p.is_enabled === 1).length;
-  const activeCount = products.filter(p => p.status === 'active').length;
-  const draftCount = products.filter(p => p.status === 'draft').length;
+  // Store-wide totals from /api/products/stats — NOT the current page slice.
+  const totalProducts = stats.total;
+  const enabledInAI = stats.enabled_in_ai;
+  const activeCount = stats.active;
+  const draftCount = stats.draft;
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
 
   const productRows = filteredProducts.map(product => [
@@ -951,7 +977,7 @@ export default function ProductSync() {
     log.active_products || 0,
     log.embedded_products || 0,
     log.duration_seconds ? `${log.duration_seconds.toFixed(1)}s` : '—',
-    <Badge key={`status-${log.id}`} tone={log.status === 'success' ? 'success' : log.status === 'running' ? 'info' : 'critical'}>{log.status}</Badge>,
+    <Badge key={`status-${log.id}`} tone={log.status === 'success' ? 'success' : log.status === 'running' ? 'info' : log.status === 'partial' ? 'warning' : 'critical'}>{log.status}</Badge>,
   ]);
 
   if (loading) {
