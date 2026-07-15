@@ -20,7 +20,7 @@ from app.services.store_service import get_store_config
 
 
 _CLIENT_CACHE: dict = {}
-_CACHE_TTL = 300
+_CACHE_TTL = 1800  # store credentials rarely change; avoids re-describing the Pinecone index on almost every request
 
 
 def _store_base_url(store) -> str:

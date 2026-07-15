@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from langchain_openai import OpenAIEmbeddings
@@ -76,8 +77,12 @@ def semantic_search(
     top_k: int = 10,
     namespace: str | None = None,
     metadata_filter: dict | None = None,
+    vector: list[float] | None = None,
 ) -> list[dict[str, Any]]:
-    vector = embed_query(embeddings, query)
+    """`vector` lets callers reuse an already-computed query embedding instead
+    of paying for another OpenAI embeddings round trip for the same text."""
+    if vector is None:
+        vector = embed_query(embeddings, query)
     kwargs: dict[str, Any] = {
         "vector": vector,
         "top_k": top_k,
@@ -96,21 +101,49 @@ def semantic_search(
     return results
 
 
+def _gender_clause(gender: str | None) -> dict | None:
+    if not gender or gender == "mixte":
+        return None
+    # Products explicitly tagged for the other gender are excluded, but
+    # ungendered/unisex-tagged products (empty metadata, "mixte") still match.
+    return {"gender": {"$in": [gender, "mixte", "unisexe", ""]}}
+
+
 def search_international(
     index,
     embeddings: OpenAIEmbeddings,
     query: str,
     store_base_url: str,
     top_k: int = 5,
+    vector: list[float] | None = None,
+    gender: str | None = None,
 ) -> list[dict[str, Any]]:
-    return semantic_search(
-        index,
-        embeddings,
-        query,
-        store_base_url,
-        top_k=top_k,
-        metadata_filter={"source_type": {"$eq": SOURCE_INTERNATIONAL}},
+    base_filt: dict = {"source_type": {"$eq": SOURCE_INTERNATIONAL}}
+    gender_clause = _gender_clause(gender)
+    filt = {"$and": [base_filt, gender_clause]} if gender_clause else base_filt
+    hits = semantic_search(
+        index, embeddings, query, store_base_url,
+        top_k=top_k, metadata_filter=filt, vector=vector,
     )
+    if not hits and gender_clause:
+        # Vectors embedded before gender metadata existed (pre-resync) have
+        # no `gender` field at all, so Pinecone excludes them from any
+        # filter referencing it — fall back to an unfiltered search rather
+        # than showing the customer nothing.
+        hits = semantic_search(
+            index, embeddings, query, store_base_url,
+            top_k=top_k, metadata_filter=base_filt, vector=vector,
+        )
+    return hits
+
+
+def _price_clauses(min_price: float | None, max_price: float | None) -> list[dict]:
+    clauses = []
+    if min_price is not None:
+        clauses.append({"price": {"$gte": min_price}})
+    if max_price is not None:
+        clauses.append({"price": {"$lte": max_price}})
+    return clauses
 
 
 def search_shopify_products(
@@ -120,23 +153,32 @@ def search_shopify_products(
     store_base_url: str,
     shop: str | None = None,
     top_k: int = 10,
+    vector: list[float] | None = None,
+    gender: str | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
 ) -> list[dict[str, Any]]:
-    filt: dict[str, Any] = {"source_type": {"$eq": SOURCE_SHOPIFY}}
+    base_clauses: list[dict] = [{"source_type": {"$eq": SOURCE_SHOPIFY}}]
     if shop:
-        filt = {
-            "$and": [
-                {"source_type": {"$eq": SOURCE_SHOPIFY}},
-                {"shop": {"$eq": shop}},
-            ]
-        }
-    return semantic_search(
-        index,
-        embeddings,
-        query,
-        store_base_url,
-        top_k=top_k,
-        metadata_filter=filt,
+        base_clauses.append({"shop": {"$eq": shop}})
+    # Price has always been stored as a numeric field, so unlike gender there's
+    # no pre-resync "missing metadata" gap to fall back from — an empty result
+    # here genuinely means nothing in the catalog matches that budget.
+    base_clauses += _price_clauses(min_price, max_price)
+    base_filt = base_clauses[0] if len(base_clauses) == 1 else {"$and": base_clauses}
+
+    gender_clause = _gender_clause(gender)
+    filt = {"$and": base_clauses + [gender_clause]} if gender_clause else base_filt
+    hits = semantic_search(
+        index, embeddings, query, store_base_url,
+        top_k=top_k, metadata_filter=filt, vector=vector,
     )
+    if not hits and gender_clause:
+        hits = semantic_search(
+            index, embeddings, query, store_base_url,
+            top_k=top_k, metadata_filter=base_filt, vector=vector,
+        )
+    return hits
 
 
 def search_knowledge_base(
@@ -145,15 +187,26 @@ def search_knowledge_base(
     query: str,
     store_base_url: str,
     top_k: int = 5,
+    vector: list[float] | None = None,
 ) -> list[dict]:
-    """Search pages, blogs, and custom namespaces."""
-    combined = []
-    for ns in ("pages", "blogs", "custom"):
+    """Search pages, blogs, and custom namespaces. The query is embedded once
+    and the three namespace queries run in parallel (independent I/O-bound
+    Pinecone calls), instead of three sequential embed+query round trips."""
+    if vector is None:
+        vector = embed_query(embeddings, query)
+
+    def _search_ns(ns: str) -> list[dict]:
         hits = semantic_search(
             index, embeddings, query, store_base_url,
-            top_k=top_k, namespace=ns,
+            top_k=top_k, namespace=ns, vector=vector,
         )
         for h in hits:
             h["namespace"] = ns
-        combined.extend(hits)
+        return hits
+
+    namespaces = ("pages", "blogs", "custom")
+    combined: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(namespaces)) as pool:
+        for hits in pool.map(_search_ns, namespaces):
+            combined.extend(hits)
     return combined

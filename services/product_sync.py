@@ -22,9 +22,9 @@ Responsibilities:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 
-import requests
 from pinecone import Pinecone
 from sqlalchemy.orm import Session
 
@@ -34,7 +34,8 @@ from app.rag.constants import SOURCE_SHOPIFY
 from app.services.embedding_service import generate_embedding
 from app.services.international_sync import sync_shopify_product_to_main_db
 from app.services.note_extractor import extract_notes_from_description
-from app.services.shopify_service import fetch_products
+from app.services.note_store import normalize_gender
+from app.services.shopify_service import shopify_get_with_retry, fetch_products
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -53,22 +54,34 @@ def _parse_shopify_dt(value) -> datetime | None:
         return None
 
 
+def _fetch_all_paginated(url: str, token: str, key: str) -> list:
+    """Follows Shopify's Link-header cursor pagination (with 429 retry) so
+    stores with more than one page (250) of collections/collects aren't
+    silently truncated."""
+    items: list = []
+    headers = {"X-Shopify-Access-Token": token}
+    while url:
+        res = shopify_get_with_retry(url, headers=headers)
+        items.extend(res.json().get(key, []))
+        link_header = res.headers.get("Link", "")
+        match = re.search(r'<([^>]+)>;\s*rel="next"', link_header)
+        url = match.group(1) if match else None
+    return items
+
+
 def fetch_all_custom_collections(token, shop):
     url = f"https://{shop}/admin/api/{API_VERSION}/custom_collections.json?limit=250"
-    res = requests.get(url, headers={"X-Shopify-Access-Token": token}, timeout=30)
-    return res.json().get("custom_collections", [])
+    return _fetch_all_paginated(url, token, "custom_collections")
 
 
 def fetch_all_smart_collections(token, shop):
     url = f"https://{shop}/admin/api/{API_VERSION}/smart_collections.json?limit=250"
-    res = requests.get(url, headers={"X-Shopify-Access-Token": token}, timeout=30)
-    return res.json().get("smart_collections", [])
+    return _fetch_all_paginated(url, token, "smart_collections")
 
 
 def fetch_all_collects(token, shop):
     url = f"https://{shop}/admin/api/{API_VERSION}/collects.json?limit=250"
-    res = requests.get(url, headers={"X-Shopify-Access-Token": token}, timeout=30)
-    return res.json().get("collects", [])
+    return _fetch_all_paginated(url, token, "collects")
 
 
 def _build_collection_map(store) -> dict:
@@ -283,6 +296,7 @@ def sync_shopify_products(db: Session, shop: str, store) -> dict:
             notes = extract_notes_from_description(
                 product.title or "", product.description or "", store.openai_api_key,
                 model=getattr(store, "openai_model", None) or "gpt-4o-mini",
+                product_type=product.product_type or "",
             )
             sync_shopify_product_to_main_db(db, product, shop, notes=notes)
 
@@ -339,6 +353,7 @@ def sync_shopify_products(db: Session, shop: str, store) -> dict:
                 "heart_note": notes.heart_note,
                 "base_note": notes.base_note,
                 "olfactive": notes.olfactive,
+                "gender": normalize_gender(notes.gender) or "",
             }
             vectors_to_upsert.append((str(product.id), embedding, metadata))
 

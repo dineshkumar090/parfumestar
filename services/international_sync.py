@@ -12,7 +12,7 @@ from app.database.international_db import international_engine
 from app.models.main_database import UnifiedProduct
 from app.rag.constants import SOURCE_INTERNATIONAL
 from app.services.note_extractor import fields_from_international_row
-from app.services.note_store import apply_notes_to_unified, sync_perfume_notes_table
+from app.services.note_store import apply_notes_to_unified, normalize_gender, sync_perfume_notes_table
 
 
 def fetch_product_recoms(limit: int | None = None) -> list[dict[str, Any]]:
@@ -81,7 +81,7 @@ def sync_international_to_main_db(db: Session, limit: int | None = None) -> dict
             top_note=extracted.top_note,
             heart_note=extracted.heart_note,
             base_note=extracted.base_note,
-            gender=raw.get("gender"),
+            gender=normalize_gender(raw.get("gender")),
             product_type=raw.get("parfums"),
             year=raw.get("year"),
             status=raw.get("status") or "Public",
@@ -161,6 +161,9 @@ def sync_shopify_product_to_main_db(
         is_enabled=product.is_enabled,
         pinecone_id=str(product.id),
     )
+    gender = normalize_gender(getattr(notes, "gender", ""))
+    if gender:
+        fields["gender"] = gender
 
     if row:
         for k, v in fields.items():

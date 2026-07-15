@@ -1,7 +1,30 @@
+import time
+
 import requests
 import re
 
 API_VERSION = "2024-01"
+
+
+def shopify_get_with_retry(url: str, headers: dict, timeout: int = 30, max_retries: int = 5):
+    """GET with Shopify rate-limit (429) handling. Shopify's admin API buckets
+    requests at ~2/sec; without this, a single 429 during a paginated sync
+    (common on stores with hundreds of products) aborted the whole fetch
+    loop and silently returned a partial product list."""
+    attempt = 0
+    while True:
+        response = requests.get(url, headers=headers, timeout=timeout)
+        if response.status_code == 429 and attempt < max_retries:
+            wait = float(response.headers.get("Retry-After", 2 * (attempt + 1)))
+            time.sleep(wait)
+            attempt += 1
+            continue
+        if response.status_code >= 500 and attempt < max_retries:
+            time.sleep(2 * (attempt + 1))
+            attempt += 1
+            continue
+        response.raise_for_status()
+        return response
 
 
 # ✅ Helper to normalize shop URL
@@ -20,16 +43,13 @@ def fetch_products(access_token: str, shop_url: str):
 
     while url:
         try:
-            response = requests.get(
+            response = shopify_get_with_retry(
                 url,
                 headers={
                     "X-Shopify-Access-Token": access_token,
                     "Content-Type": "application/json"
                 },
-                timeout=30
             )
-
-            response.raise_for_status()
 
             data = response.json()
             products = data.get("products", [])

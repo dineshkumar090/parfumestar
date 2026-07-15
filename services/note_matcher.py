@@ -30,6 +30,9 @@ def match_shopify_by_sql_notes(
     international_unified_id: int,
     shop: str,
     top_k: int = 5,
+    gender: str | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
 ) -> list[tuple[UnifiedProduct, float]]:
     """
     Find Shopify products with the most overlapping normalized notes.
@@ -45,7 +48,7 @@ def match_shopify_by_sql_notes(
     if not ref_note_names:
         return []
 
-    rows = (
+    query = (
         db.query(
             PerfumeNote.unified_product_id,
             func.count(PerfumeNote.id).label("match_count"),
@@ -57,6 +60,21 @@ def match_shopify_by_sql_notes(
             UnifiedProduct.is_enabled == 1,
             PerfumeNote.note_name.in_(ref_note_names),
         )
+    )
+    if gender and gender != "mixte":
+        query = query.filter(
+            (UnifiedProduct.gender == gender)
+            | (UnifiedProduct.gender == "mixte")
+            | (UnifiedProduct.gender.is_(None))
+            | (UnifiedProduct.gender == "")
+        )
+    if min_price is not None:
+        query = query.filter(UnifiedProduct.price >= min_price)
+    if max_price is not None:
+        query = query.filter(UnifiedProduct.price <= max_price)
+
+    rows = (
+        query
         .group_by(PerfumeNote.unified_product_id)
         .order_by(func.count(PerfumeNote.id).desc())
         .limit(top_k)
@@ -98,6 +116,7 @@ def unified_to_widget_products(
             "heart_note": row.heart_note or "",
             "base_note": row.base_note or "",
             "olfactive": row.olfactive or "",
+            "gender": row.gender or "",
             "source_type": SOURCE_SHOPIFY,
         }
         if product.variants and isinstance(product.variants, list) and product.variants:

@@ -139,8 +139,15 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
         intent_detail=intent_detail,
     )
 
-    # Policy / knowledge for general perfume questions
-    if intent in (ChatIntent.GENERAL.value, ChatIntent.RECOMMENDATION_SEARCH.value) and not products:
+    # Policy / knowledge fallback — also covers product_knowledge_query, since
+    # generic perfumery questions ("qu'est-ce que l'oud ?", ingredient/allergy
+    # questions not tied to a specific product) previously got neither a
+    # product match nor any store content and left the LLM with nothing.
+    if intent in (
+        ChatIntent.GENERAL.value,
+        ChatIntent.RECOMMENDATION_SEARCH.value,
+        ChatIntent.PRODUCT_KNOWLEDGE.value,
+    ) and not products:
         kb = search_knowledge_base(
             state["index"], state["embeddings"],
             state["query"], state["store_base_url"], top_k=3,
@@ -161,14 +168,25 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
     Shared by the synchronous graph node and the streaming chat endpoint
     so both produce identical prompts."""
     products = state.get("shopify_products") or []
+    is_comparison = state.get("pipeline_path") == "comparison"
     products_ctx = ""
     for i, p in enumerate(products[:5], 1):
         note_info = ", ".join(filter(None, [
             p.get("top_note"), p.get("heart_note"), p.get("base_note"), p.get("olfactive"),
         ]))
+        gender_line = f"   Genre: {p['gender']}\n" if p.get("gender") else ""
+        # Notes alone don't cover attribute questions (allergies, sensitive
+        # skin, longevity, season/occasion, gift-worthiness) — those live in
+        # free-text description, which used to only appear when notes were
+        # entirely missing. Always include a short snippet alongside notes.
+        desc = (p.get("description") or "")[:220]
+        desc_line = f"   Description: {desc}\n" if desc else ""
+        label = f"Parfum {chr(64 + i)}" if is_comparison else str(i)
         products_ctx += (
-            f"\n{i}. {p.get('title', '')} — {p.get('price', 0)}€\n"
-            f"   Notes: {note_info or p.get('description', '')[:180]}\n"
+            f"\n{label}. {p.get('title', '')} — {p.get('price', 0)}€\n"
+            f"   Notes: {note_info or 'non précisées'}\n"
+            f"{desc_line}"
+            f"{gender_line}"
             f"   URL: {p.get('product_url', '')}\n"
         )
 

@@ -21,11 +21,34 @@ def normalize_note_name(raw: str) -> str:
     return " ".join(text.split())
 
 
+_GENDER_MAP = {
+    "femme": "femme", "female": "femme", "women": "femme", "woman": "femme",
+    "elle": "femme", "her": "femme", "f": "femme",
+    "homme": "homme", "male": "homme", "men": "homme", "man": "homme",
+    "lui": "homme", "him": "homme", "m": "homme",
+    "mixte": "mixte", "unisexe": "mixte", "unisex": "mixte", "both": "mixte",
+}
+
+
+def normalize_gender(raw: str | None) -> str:
+    """Canonicalize a gender value from any source (international MySQL DB,
+    Shopify description, LLM extraction) to 'femme' / 'homme' / 'mixte' / ''
+    so Pinecone/SQL gender filters compare like with like."""
+    if not raw:
+        return ""
+    key = unicodedata.normalize("NFKD", raw.strip().lower())
+    key = "".join(c for c in key if not unicodedata.combining(c))
+    return _GENDER_MAP.get(key, "")
+
+
 def apply_notes_to_unified(row: UnifiedProduct, notes: ExtractedNotes) -> None:
     row.olfactive = notes.olfactive or row.olfactive
     row.top_note = notes.top_note or row.top_note
     row.heart_note = notes.heart_note or row.heart_note
     row.base_note = notes.base_note or row.base_note
+    gender = normalize_gender(getattr(notes, "gender", ""))
+    if gender:
+        row.gender = gender
 
 
 def sync_perfume_notes_table(

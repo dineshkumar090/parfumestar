@@ -53,6 +53,14 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "perfumestar")
 # Semantic score threshold — skip note matching when Shopify match is this strong
 SHOPIFY_DIRECT_MATCH_THRESHOLD = float(os.getenv("SHOPIFY_DIRECT_MATCH_THRESHOLD", "0.78"))
 
+# Pinecone always returns a nearest neighbor for top_k>=1 even when nothing is
+# actually relevant. Below this score, a query isn't treated as "about" that
+# international perfume unless the customer explicitly named a brand
+# (is_international_reference) — otherwise vague queries like "les meilleurs
+# parfums" or "parfums pour l'été" would get a random international perfume
+# forced into the answer as if the customer had asked about it specifically.
+INTERNATIONAL_MATCH_THRESHOLD = float(os.getenv("INTERNATIONAL_MATCH_THRESHOLD", "0.72"))
+
 
 def _mysql_uri(host, port, user, password, db) -> str:
     return f"mysql+pymysql://{user}:{password}@{host}:{port}/{db}?charset=utf8mb4"

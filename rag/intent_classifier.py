@@ -1,6 +1,7 @@
 """LangChain structured intent classification."""
 
 import json
+import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -22,6 +23,31 @@ class IntentClassification(BaseModel):
         default=False,
         description="True if user asks about a Parfums Star / Star n° product",
     )
+    gender_preference: str = Field(
+        default="",
+        description=(
+            "'femme' if the customer wants a women's/ladies perfume, 'homme' if "
+            "men's, 'mixte' if explicitly unisex, or '' if no gender was implied"
+        ),
+    )
+    max_price: float | None = Field(
+        default=None, description="Upper price bound in euros if the customer gave a budget"
+    )
+    min_price: float | None = Field(
+        default=None, description="Lower price bound in euros, only if the customer gave a range"
+    )
+    compare_products: list[str] = Field(
+        default_factory=list,
+        description="If the customer wants to compare perfumes, the 2 product/brand names being compared",
+    )
+    needs_ingredient_info: bool = Field(
+        default=False,
+        description="True for allergy, ingredient, sensitive-skin, or composition questions",
+    )
+    is_newest_query: bool = Field(
+        default=False,
+        description="True if the customer explicitly asks for the newest/latest arrivals",
+    )
     order_id: str | None = Field(default=None)
     needs_escalation: bool = Field(default=False)
     escalation_reason: str = Field(default="")
@@ -32,8 +58,8 @@ Classifie le message client en UNE SEULE intention. Le client parle généraleme
 
 Intents:
 - reference_search: parfum de marque internationale (Chanel, Dior, Carolina Herrera CH…) pour trouver un dupe Star
-- recommendation_search: recommandations de parfums de notre boutique (humeur, occasion, notes, genre)
-- product_knowledge_query: questions sur ingrédients, notes, tenue, utilisation
+- recommendation_search: recommandations de parfums de notre boutique (humeur, occasion, notes, genre, budget, saison, cadeau)
+- product_knowledge_query: questions sur ingrédients, allergies, notes, tenue, utilisation, comparaison entre parfums
 - own_product_query: produit Parfums Star spécifique (Star n°, STAR n°)
 - store_details, payment_methods, store_information, shipping_policy, contact_information
 - offers_and_rewards, orders, order_management, returns_information, refund_policy, cancellation
@@ -45,6 +71,15 @@ Règles:
 - "CH Carolina Herrera" ou marque de luxe → reference_search + is_international_reference=true
 - "Star n° 002" → own_product_query + is_own_product=true
 - Ne jamais classer une recherche produit comme out_of_scope
+- gender_preference: si le client demande un parfum "femme"/"pour elle"/"ladies"/"women"/"her"/"féminin" → "femme".
+  Si "homme"/"pour lui"/"men"/"his"/"masculin" → "homme". Si "mixte"/"unisexe"/"unisex" → "mixte".
+  Sinon (aucune préférence exprimée) → chaîne vide "".
+- max_price/min_price: extrais tout budget mentionné ("moins de 50€" → max_price=50, "entre 20 et 40€" →
+  min_price=20, max_price=40, "budget serré" sans chiffre → laisse vide). Toujours en euros.
+- compare_products: si le client compare explicitement 2 parfums ("X ou Y ?", "différence entre X et Y"),
+  liste les 2 noms. Sinon liste vide.
+- needs_ingredient_info=true pour toute question sur allergies, ingrédients, composition, peau sensible.
+- is_newest_query=true pour "nouveautés", "derniers parfums sortis", "dernières sorties", "nouveaux produits".
 
 Réponds en JSON valide uniquement."""
 
@@ -71,47 +106,122 @@ def classify_intent(
 
     user_msg = f"{history_text}{shown}\nCurrent message: {query}"
 
+    result: IntentClassification | None = None
     try:
-        result = structured.invoke([
+        structured_result = structured.invoke([
             SystemMessage(content=INTENT_SYSTEM_PROMPT),
             HumanMessage(content=user_msg),
         ])
-        if isinstance(result, IntentClassification):
-            return result
+        if isinstance(structured_result, IntentClassification):
+            result = structured_result
     except Exception as e:
         print(f"[INTENT] structured output failed: {e}")
 
-    # Fallback: raw JSON parse
-    try:
-        resp = llm.invoke([
-            SystemMessage(content=INTENT_SYSTEM_PROMPT + "\nReturn JSON only."),
-            HumanMessage(content=user_msg),
-        ])
-        raw = resp.content.strip()
-        if "```" in raw:
-            raw = raw.split("```")[1].replace("json", "").strip()
-        data = json.loads(raw)
-        return IntentClassification(**data)
-    except Exception:
-        pass
+    if result is None:
+        # Fallback: raw JSON parse
+        try:
+            resp = llm.invoke([
+                SystemMessage(content=INTENT_SYSTEM_PROMPT + "\nReturn JSON only."),
+                HumanMessage(content=user_msg),
+            ])
+            raw = resp.content.strip()
+            if "```" in raw:
+                raw = raw.split("```")[1].replace("json", "").strip()
+            data = json.loads(raw)
+            result = IntentClassification(**data)
+        except Exception:
+            pass
 
-    # Heuristic fallback
-    q = query.lower()
-    if any(w in q for w in ("order", "tracking", "shipment", "delivery")):
-        return IntentClassification(intent=ChatIntent.ORDERS.value, confidence=0.6)
-    if "star n" in q or "star no" in q or "star n°" in q:
-        return IntentClassification(
-            intent=ChatIntent.OWN_PRODUCT.value,
-            is_own_product=True,
-            confidence=0.7,
-        )
-    if any(brand in q for brand in ("carolina herrera", "chanel", "dior", "ysl", "gucci", "tom ford")):
-        return IntentClassification(
-            intent=ChatIntent.REFERENCE_SEARCH.value,
-            is_international_reference=True,
-            confidence=0.7,
-        )
-    return IntentClassification(intent=ChatIntent.GENERAL.value, confidence=0.5)
+    if result is None:
+        # Heuristic fallback
+        q = query.lower()
+        gender = _heuristic_gender(q)
+        min_price, max_price = _heuristic_price_range(q)
+        if any(w in q for w in ("order", "tracking", "shipment", "delivery")):
+            result = IntentClassification(intent=ChatIntent.ORDERS.value, confidence=0.6)
+        elif "star n" in q or "star no" in q or "star n°" in q:
+            result = IntentClassification(
+                intent=ChatIntent.OWN_PRODUCT.value,
+                is_own_product=True,
+                gender_preference=gender,
+                min_price=min_price, max_price=max_price,
+                confidence=0.7,
+            )
+        elif any(brand in q for brand in ("carolina herrera", "chanel", "dior", "ysl", "gucci", "tom ford")):
+            result = IntentClassification(
+                intent=ChatIntent.REFERENCE_SEARCH.value,
+                is_international_reference=True,
+                gender_preference=gender,
+                min_price=min_price, max_price=max_price,
+                confidence=0.7,
+            )
+        else:
+            result = IntentClassification(
+                intent=ChatIntent.GENERAL.value, gender_preference=gender,
+                min_price=min_price, max_price=max_price, confidence=0.5,
+            )
+
+    # Belt-and-suspenders: a regex catches explicit price mentions the LLM
+    # sometimes drops (especially with unusual phrasing), and flags obvious
+    # "newest arrivals" queries even if the model didn't set the flag.
+    q_lower = query.lower()
+    if result.max_price is None and result.min_price is None:
+        min_p, max_p = _heuristic_price_range(q_lower)
+        result.min_price, result.max_price = min_p, max_p
+    if not result.is_newest_query and _heuristic_is_newest(q_lower):
+        result.is_newest_query = True
+
+    return result
+
+
+_FEMME_WORDS = ("femme", "pour elle", "ladies", "lady", "women", "woman", "her ", "féminin", "feminin")
+_HOMME_WORDS = ("homme", "pour lui", "men's", " men", "man ", "his ", "masculin")
+_MIXTE_WORDS = ("mixte", "unisexe", "unisex")
+
+
+def _heuristic_gender(q: str) -> str:
+    if any(w in q for w in _MIXTE_WORDS):
+        return "mixte"
+    if any(w in q for w in _FEMME_WORDS):
+        return "femme"
+    if any(w in q for w in _HOMME_WORDS):
+        return "homme"
+    return ""
+
+
+_PRICE_NUM = r"(\d+(?:[.,]\d+)?)"
+_PRICE_UNIT = r"(?:€|eur(?:os?)?)"
+_PRICE_RANGE_RE = re.compile(
+    rf"entre\s+{_PRICE_NUM}\s*(?:{_PRICE_UNIT})?\s+et\s+{_PRICE_NUM}\s*{_PRICE_UNIT}?", re.IGNORECASE
+)
+_PRICE_MAX_RE = re.compile(
+    rf"(?:moins de|max(?:imum)?|sous|budget(?: de)?|jusqu'?\s*[aà]|en dessous de|inf[ée]rieur[e]?\s*[aà])\s*{_PRICE_NUM}\s*{_PRICE_UNIT}?",
+    re.IGNORECASE,
+)
+_PRICE_MIN_RE = re.compile(
+    rf"(?:plus de|min(?:imum)?|au-?dessus de|sup[ée]rieur[e]?\s*[aà])\s*{_PRICE_NUM}\s*{_PRICE_UNIT}?",
+    re.IGNORECASE,
+)
+
+
+def _heuristic_price_range(q: str) -> tuple[float | None, float | None]:
+    m = _PRICE_RANGE_RE.search(q)
+    if m:
+        a, b = float(m.group(1).replace(",", ".")), float(m.group(2).replace(",", "."))
+        return (min(a, b), max(a, b))
+    max_m = _PRICE_MAX_RE.search(q)
+    max_price = float(max_m.group(1).replace(",", ".")) if max_m else None
+    min_m = _PRICE_MIN_RE.search(q)
+    min_price = float(min_m.group(1).replace(",", ".")) if min_m else None
+    return (min_price, max_price)
+
+
+_NEWEST_WORDS = ("nouveaut", "nouveau parfum", "nouveaux parfum", "dernière sortie",
+                  "dernieres sorties", "derniers arrivages", "vient de sortir", "new arrival", "latest")
+
+
+def _heuristic_is_newest(q: str) -> bool:
+    return any(w in q for w in _NEWEST_WORDS)
 
 
 def intent_to_response_type(intent: str) -> str:
