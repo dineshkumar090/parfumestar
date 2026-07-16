@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -10,6 +11,8 @@ from pinecone import Pinecone
 
 from app.rag.constants import SOURCE_INTERNATIONAL, SOURCE_SHOPIFY
 from app.rag.embeddings import embed_query
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def get_pinecone_index(api_key: str, index_name: str):
@@ -98,6 +101,11 @@ def semantic_search(
     for m in raw.matches or []:
         meta = m.metadata or {}
         results.append(format_product_hit(meta, store_base_url, score=m.score or 0.0))
+    logger.info(
+        "[PINECONE] query ns=%s filter=%s top_k=%s -> %s matches %s",
+        namespace or "default", metadata_filter, top_k, len(results),
+        [(r.get("id"), round(r.get("score") or 0, 3), r.get("source_type")) for r in results[:8]],
+    )
     return results
 
 
@@ -158,9 +166,16 @@ def search_shopify_products(
     min_price: float | None = None,
     max_price: float | None = None,
 ) -> list[dict[str, Any]]:
-    base_clauses: list[dict] = [{"source_type": {"$eq": SOURCE_SHOPIFY}}]
+    # Filter by `shop` (which uniquely identifies this store's Shopify products
+    # — international reference vectors carry no `shop` field) rather than by
+    # `source_type`. Some already-embedded vectors were written WITHOUT a
+    # source_type field, so a `source_type == shopify` filter silently excluded
+    # them; `shop == <domain>` matches them and still can't leak international
+    # products. When no shop is given, fall back to source_type.
     if shop:
-        base_clauses.append({"shop": {"$eq": shop}})
+        base_clauses: list[dict] = [{"shop": {"$eq": shop}}]
+    else:
+        base_clauses = [{"source_type": {"$eq": SOURCE_SHOPIFY}}]
     # Price has always been stored as a numeric field, so unlike gender there's
     # no pre-resync "missing metadata" gap to fall back from — an empty result
     # here genuinely means nothing in the catalog matches that budget.

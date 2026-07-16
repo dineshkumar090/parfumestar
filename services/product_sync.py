@@ -463,6 +463,11 @@ def _build_shopify_pinecone_metadata(product: Product, shop: str, notes: "Extrac
     return {
         "id": str(product.id),
         "shopify_id": str(product.shopify_id),
+        # CRITICAL: retrieval filters on source_type == "shopify". Without this
+        # field the vector is invisible to search (a Pinecone $eq filter
+        # excludes vectors missing the field), which is exactly what made every
+        # product embedded by this sync path unsearchable ("aucun parfum").
+        "source_type": SOURCE_SHOPIFY,
         "title": product.title or "",
         "handle": product.handle or "",
         "description": clean_html(product.description or ""),

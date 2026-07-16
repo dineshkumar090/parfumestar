@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from langchain_openai import ChatOpenAI
 
 from app.rag.constants import POLICY_INTENTS, ChatIntent
@@ -12,9 +14,13 @@ from app.rag.vector_store import search_knowledge_base, search_shopify_products
 from app.graph.state import ChatGraphState
 from app.services.recommendation_pipeline import resolve_products_for_query
 
+logger = logging.getLogger("uvicorn.error")
+
 
 def preprocess_node(state: ChatGraphState) -> ChatGraphState:
-    state["query"] = preprocess_query(state.get("query", ""))
+    raw = state.get("query", "")
+    state["query"] = preprocess_query(raw)
+    logger.info("[GRAPH] preprocess | raw=%r -> clean=%r", raw, state["query"])
     state["pipeline_path"] = "preprocess"
     return state
 
@@ -31,6 +37,11 @@ def classify_node(state: ChatGraphState) -> ChatGraphState:
     state["intent"] = clf.intent
     state["intent_detail"] = clf.model_dump()
     state["pipeline_path"] = f"classify:{clf.intent}"
+    logger.info(
+        "[GRAPH] classify | intent=%s confidence=%s intl_ref=%s own=%s gender=%s price=[%s,%s] compare=%s newest=%s",
+        clf.intent, clf.confidence, clf.is_international_reference, clf.is_own_product,
+        clf.gender_preference, clf.min_price, clf.max_price, clf.compare_products, clf.is_newest_query,
+    )
     return state
 
 
@@ -155,11 +166,16 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
         state["knowledge_context"] = "\n".join(
             f"{h.get('title', '')}: {h.get('description', '')[:300]}" for h in kb[:3]
         )
+        logger.info("[GRAPH] product_search | no products, used knowledge_base fallback (%s hits)", len(kb))
 
     state["shopify_products"] = products
     state["international_context"] = intl_ctx
     state["international_match"] = {"context_only": True} if intl_ctx else None
     state["pipeline_path"] = path
+    logger.info(
+        "[GRAPH] product_search done | path=%s shopify_products=%s titles=%s",
+        path, len(products), [(p.get("title") or "")[:30] for p in products[:5]],
+    )
     return state
 
 

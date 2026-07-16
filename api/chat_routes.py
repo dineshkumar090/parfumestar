@@ -1718,7 +1718,13 @@ async def send_chat_message_stream(
     {"final": {...full answer incl. product cards...}}."""
     from app.services.chat_orchestrator import get_chat_orchestrator
 
+    logger.info(
+        "[CHAT] POST /send-stream | shop=%s customer_id=%s email=%s query=%r",
+        req.shop, req.customer_id, req.customer_email, req.query,
+    )
+
     if not req.query.strip():
+        logger.info("[CHAT] empty query rejected")
         async def _empty():
             yield f"data: {json.dumps({'final': {'error': 'Query cannot be empty'}})}\n\n"
         return StreamingResponse(_empty(), media_type="text/event-stream")
@@ -1741,7 +1747,7 @@ async def send_chat_message_stream(
                     full_answer = event["final"]
                 yield f"data: {json.dumps(event, default=str)}\n\n"
         except Exception:
-            logger.exception("Error in chat stream")
+            logger.exception("[CHAT] Error in chat stream for shop=%s query=%r", req.shop, query_clean)
             full_answer = {
                 "type": "redirect",
                 "message": "I'm having trouble answering that. Our team can help you directly!",

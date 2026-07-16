@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import time as _time
 from typing import Any
 
@@ -18,9 +20,28 @@ from app.rag.embeddings import get_embeddings
 from app.models.chatbot_config import ChatbotConfig
 from app.services.store_service import get_store_config
 
+logger = logging.getLogger("uvicorn.error")
+
 
 _CLIENT_CACHE: dict = {}
 _CACHE_TTL = 1800  # store credentials rarely change; avoids re-describing the Pinecone index on almost every request
+
+
+# Common French function words — a cheap heuristic to log the query's language
+# (the assistant always REPLIES in French, but knowing what the customer wrote
+# in helps debugging classification/retrieval).
+_FRENCH_HINTS = re.compile(
+    r"\b(le|la|les|un|une|des|du|de|je|tu|vous|nous|pour|avec|quel|quelle|"
+    r"parfum|parfums|meilleur|meilleurs|moins|cher|offrir|femme|homme)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_language(text: str) -> str:
+    """Best-effort language hint for logging only: 'fr', 'en', or 'unknown'."""
+    if not text or not text.strip():
+        return "unknown"
+    return "fr" if _FRENCH_HINTS.search(text) else "en"
 
 
 def _store_base_url(store) -> str:
@@ -238,8 +259,14 @@ class ChatOrchestrator:
         from app.rag.prompts import PERFUME_ASSISTANT_PROMPT
         from langchain_openai import ChatOpenAI
 
+        logger.info(
+            "[CHAT] >>> stream start | shop=%s thread=%s customer=%s lang=%s query=%r",
+            shop, thread_id, customer_id, detect_language(query), query,
+        )
+
         store, prepared = self._prepare(query, shop, db, customer_id, customer_email, thread_id)
         if store is None:
+            logger.warning("[CHAT] store not configured for shop=%s — returning fallback", shop)
             yield {"final": prepared}
             return
         initial_state = prepared
@@ -247,6 +274,10 @@ class ChatOrchestrator:
         try:
             result = run_pre_generate_graph(initial_state)
             intent_detail = result.get("intent_detail") or {}
+            logger.info(
+                "[CHAT] classified | intent=%s pipeline_path=%s intent_detail=%s",
+                result.get("intent"), result.get("pipeline_path"), intent_detail,
+            )
             _log_intent(
                 db, thread_id, None, shop,
                 intent_detail,
@@ -256,9 +287,30 @@ class ChatOrchestrator:
             existing_answer = result.get("answer")
             if existing_answer:
                 # greeting / orders / out_of_scope — already complete, instant.
+                logger.info(
+                    "[CHAT] short-circuit answer (intent=%s) | %s products",
+                    result.get("intent"), len(existing_answer.get("products") or []),
+                )
                 yield {"delta": existing_answer.get("message", "")}
                 yield {"final": existing_answer}
                 return
+
+            products = result.get("shopify_products") or []
+            logger.info(
+                "[CHAT] retrieval done | pipeline_path=%s final_shopify_products=%s%s | intl_context=%s",
+                result.get("pipeline_path"), len(products),
+                " " + str([(p.get("title") or "")[:30] for p in products[:5]]) if products else "",
+                bool(result.get("international_context")),
+            )
+
+            chain_inputs = build_generate_chain_inputs(result)
+            logger.info(
+                "[CHAT] LLM context | products_sent=%s\n--- products_context ---\n%s\n--- knowledge_context ---\n%s\n--- international_context ---\n%s",
+                len(products),
+                chain_inputs.get("products_context", "")[:1500],
+                (chain_inputs.get("knowledge_context") or "")[:500],
+                (chain_inputs.get("international_context") or "")[:500],
+            )
 
             llm = ChatOpenAI(
                 model=result.get("model_name", "gpt-4o-mini"),
@@ -267,7 +319,6 @@ class ChatOrchestrator:
                 streaming=True,
             )
             chain = PERFUME_ASSISTANT_PROMPT | llm
-            chain_inputs = build_generate_chain_inputs(result)
 
             full_text = ""
             for chunk in chain.stream(chain_inputs):
@@ -276,12 +327,16 @@ class ChatOrchestrator:
                     full_text += piece
                     yield {"delta": piece}
 
+            logger.info("[CHAT] <<< LLM response (%s chars): %r", len(full_text), full_text[:600])
             answer = finalize_answer(result, full_text)
+            logger.info(
+                "[CHAT] final answer | type=%s show_products=%s products=%s show_contact=%s",
+                answer.get("type"), answer.get("show_products"),
+                len(answer.get("products") or []), answer.get("show_contact"),
+            )
             yield {"final": answer}
-        except Exception as e:
-            print(f"[ORCHESTRATOR] stream error: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            logger.exception("[CHAT] stream error for shop=%s query=%r", shop, query)
             yield {"final": {
                 "type": "redirect",
                 "message": "I'm having trouble answering that. Our team can help you directly!",

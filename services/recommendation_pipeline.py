@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy.orm import Session
@@ -16,6 +17,20 @@ from app.services.note_matcher import (
     match_shopify_by_sql_notes,
     unified_to_widget_products,
 )
+
+logger = logging.getLogger("uvicorn.error")
+
+
+def _fmt_hits(hits: list[dict], limit: int = 8) -> str:
+    """Compact one-line summary of search hits for logging: id/title/score/source."""
+    parts = []
+    for h in hits[:limit]:
+        parts.append(
+            f"{h.get('id', '?')}:{(h.get('title') or '')[:28]!r}"
+            f"(score={round(h.get('score') or 0, 3)},src={h.get('source_type', '?')})"
+        )
+    extra = f" (+{len(hits) - limit} more)" if len(hits) > limit else ""
+    return "[" + ", ".join(parts) + "]" + extra
 
 
 def _newest_shopify_products(
@@ -103,13 +118,22 @@ def resolve_products_for_query(
     max_price = intent_detail.get("max_price")
     compare_products = intent_detail.get("compare_products") or []
 
+    logger.info(
+        "[RAG] resolve start | query=%r shop=%s intent=%s is_intl_ref=%s is_own=%s "
+        "gender=%s price=[%s,%s] compare=%s newest=%s",
+        query, shop, intent, is_intl_ref, is_own, gender, min_price, max_price,
+        compare_products, intent_detail.get("is_newest_query"),
+    )
+
     if len(compare_products) >= 2:
         widget = _compare_products(index, embeddings, store_base_url, shop, compare_products, gender)
+        logger.info("[RAG] comparison branch | names=%s -> %s products", compare_products, len(widget))
         if widget:
             return widget, "", "comparison"
 
     if intent_detail.get("is_newest_query"):
         newest = _newest_shopify_products(db, shop, store_base_url, gender, min_price, max_price, top_k=5)
+        logger.info("[RAG] newest branch | -> %s products", len(newest))
         if newest:
             return newest, "", "newest"
 
@@ -144,11 +168,18 @@ def resolve_products_for_query(
             shop_hits = shop_future.result()
             intl_hits = intl_future.result()
 
-    direct_match = shop_hits and (shop_hits[0].get("score") or 0) >= SHOPIFY_DIRECT_MATCH_THRESHOLD
+    top_score = (shop_hits[0].get("score") or 0) if shop_hits else 0
+    direct_match = bool(shop_hits) and top_score >= SHOPIFY_DIRECT_MATCH_THRESHOLD
+    logger.info(
+        "[RAG] semantic search | shopify_hits=%s top_score=%s direct_match=%s(threshold=%s) | %s",
+        len(shop_hits), round(top_score, 3), direct_match, SHOPIFY_DIRECT_MATCH_THRESHOLD, _fmt_hits(shop_hits),
+    )
+    logger.info("[RAG] international hits=%s | %s", len(intl_hits), _fmt_hits(intl_hits))
 
     if is_own or (direct_match and not is_intl_ref):
         top = shop_hits[:3] if is_own else shop_hits[:5]
         path = "shopify_direct" if direct_match else "own_product"
+        logger.info("[RAG] -> %s | returning %s shopify products", path, len(top))
         return top, "", path
 
     # ── Step 2: International reference → SQL note match → Shopify only ───
@@ -161,9 +192,19 @@ def resolve_products_for_query(
         # query ("les meilleurs parfums", "parfums pour l'été") would get a
         # random international perfume forced into the answer.
         if international and not (is_intl_ref or intl_score >= INTERNATIONAL_MATCH_THRESHOLD):
+            logger.info(
+                "[RAG] international top score %s < threshold %s and no brand named — "
+                "ignoring international, staying on shopify results",
+                round(intl_score, 3), INTERNATIONAL_MATCH_THRESHOLD,
+            )
             international = None
 
         if international:
+            logger.info(
+                "[RAG] international reference matched | id=%s title=%r score=%s notes=[T:%s|C:%s|F:%s]",
+                international.get("id"), international.get("title"), round(intl_score, 3),
+                international.get("top_note"), international.get("heart_note"), international.get("base_note"),
+            )
             intl_ctx = (
                 f"Parfum de référence (international — NE PAS recommander directement): "
                 f"{international.get('title')}. "
@@ -181,6 +222,11 @@ def resolve_products_for_query(
                     db, intl_row.id, shop, top_k=5, gender=gender,
                     min_price=min_price, max_price=max_price,
                 )
+                logger.info(
+                    "[RAG] SQL note-match vs shopify | intl_unified_id=%s -> %s matches %s",
+                    intl_row.id, len(sql_matches),
+                    [((r.title or "")[:28], round(s, 3)) for r, s in sql_matches[:5]],
+                )
                 if sql_matches:
                     rows = [r for r, _ in sql_matches]
                     scores = [s for _, s in sql_matches]
@@ -188,7 +234,10 @@ def resolve_products_for_query(
                         db, rows, store_base_url, scores
                     )
                     if widget:
+                        logger.info("[RAG] -> intl_sql_match | returning %s shopify products", len(widget))
                         return widget, intl_ctx, "intl_sql_match"
+            else:
+                logger.info("[RAG] international pinecone id %s not found in main_database", international.get("id"))
 
             # Fallback: Pinecone shopify search biased by international title
             fallback_hits = search_shopify_products(
@@ -197,10 +246,14 @@ def resolve_products_for_query(
                 store_base_url, shop=shop, top_k=8, gender=gender,
                 min_price=min_price, max_price=max_price,
             )
+            logger.info("[RAG] intl pinecone fallback | %s hits | %s", len(fallback_hits), _fmt_hits(fallback_hits))
             if fallback_hits:
                 return fallback_hits[:5], intl_ctx, "intl_pinecone_fallback"
 
+            logger.info("[RAG] -> intl_no_match | 0 shopify products")
             return [], intl_ctx, "intl_no_match"
 
     # ── Step 3: Recommendation / general — Shopify semantic only ──────────
-    return (shop_hits[:5] if shop_hits else []), "", "shopify_semantic"
+    final = shop_hits[:5] if shop_hits else []
+    logger.info("[RAG] -> shopify_semantic | returning %s shopify products", len(final))
+    return final, "", "shopify_semantic"
