@@ -26,6 +26,7 @@ def preprocess_node(state: ChatGraphState) -> ChatGraphState:
 
 
 def classify_node(state: ChatGraphState) -> ChatGraphState:
+    logger.info("[GRAPH] node=classify | query=%r", state.get("query"))
     titles = [p.get("title", "") for p in state.get("last_shown_products", []) if p.get("title")]
     clf = classify_intent(
         state["query"],
@@ -48,17 +49,21 @@ def classify_node(state: ChatGraphState) -> ChatGraphState:
 def route_after_classify(state: ChatGraphState) -> str:
     intent = state.get("intent", ChatIntent.GENERAL.value)
     if intent == ChatIntent.GREETING.value:
-        return "greeting"
-    if intent == ChatIntent.OUT_OF_SCOPE.value:
-        return "out_of_scope"
-    if intent in (ChatIntent.ORDERS.value, ChatIntent.ORDER_MANAGEMENT.value):
-        return "orders"
-    if intent in POLICY_INTENTS:
-        return "policy"
-    return "product_search"
+        route = "greeting"
+    elif intent == ChatIntent.OUT_OF_SCOPE.value:
+        route = "out_of_scope"
+    elif intent in (ChatIntent.ORDERS.value, ChatIntent.ORDER_MANAGEMENT.value):
+        route = "orders"
+    elif intent in POLICY_INTENTS:
+        route = "policy"
+    else:
+        route = "product_search"
+    logger.info("[GRAPH] route_after_classify | intent=%s -> node=%s", intent, route)
+    return route
 
 
 def greeting_node(state: ChatGraphState) -> ChatGraphState:
+    logger.info("[GRAPH] node=greeting")
     brand = state.get("brand_name", "Assistant")
     state["answer"] = {
         "type": "general",
@@ -78,6 +83,7 @@ def greeting_node(state: ChatGraphState) -> ChatGraphState:
 
 
 def out_of_scope_node(state: ChatGraphState) -> ChatGraphState:
+    logger.info("[GRAPH] node=out_of_scope | query=%r", state.get("query"))
     llm = ChatOpenAI(model=state["model_name"], api_key=state["oai_api_key"], temperature=0.3)
     chain = OUT_OF_SCOPE_PROMPT | llm
     resp = chain.invoke({"query": state["query"]})
@@ -96,6 +102,7 @@ def out_of_scope_node(state: ChatGraphState) -> ChatGraphState:
 
 
 def orders_node(state: ChatGraphState) -> ChatGraphState:
+    logger.info("[GRAPH] node=orders | query=%r", state.get("query"))
     from app.services.chat_legacy import handle_order_intent
 
     answer = handle_order_intent(
@@ -117,6 +124,7 @@ def orders_node(state: ChatGraphState) -> ChatGraphState:
 
 
 def policy_node(state: ChatGraphState) -> ChatGraphState:
+    logger.info("[GRAPH] node=policy | intent=%s query=%r", state.get("intent"), state.get("query"))
     hits = search_knowledge_base(
         state["index"],
         state["embeddings"],
@@ -130,14 +138,35 @@ def policy_node(state: ChatGraphState) -> ChatGraphState:
     state["knowledge_context"] = "\n".join(ctx_parts)
     state["shopify_products"] = []
     state["pipeline_path"] = f"policy:{state.get('intent')}"
+    logger.info("[GRAPH] policy | knowledge_base hits=%s", len(hits))
     return state
 
 
 def product_search_node(state: ChatGraphState) -> ChatGraphState:
     """Unified product search: Shopify direct OR international → SQL notes → Shopify only."""
+    logger.info("[GRAPH] node=product_search | query=%r", state.get("query"))
     db = state.get("_db")
     intent = state.get("intent", "general")
     intent_detail = state.get("intent_detail", {})
+
+    # Follow-up informational question about a product already shown/discussed
+    # ("how long does it last?", "is it good for summer?") — the customer isn't
+    # asking for new recommendations, so running the full retrieval pipeline
+    # (embeddings + Pinecone + note-matching) is both wasted work and risks
+    # replacing the product they're actually asking about with something else.
+    # Reuse what was already shown as the answer context instead.
+    last_shown = state.get("last_shown_products") or []
+    if intent_detail.get("skip_product_search") and last_shown:
+        logger.info(
+            "[GRAPH] product_search SKIPPED — follow-up question about previously shown product(s): %s",
+            [(p.get("title") or "")[:30] for p in last_shown[:5]],
+        )
+        state["shopify_products"] = last_shown
+        state["international_context"] = ""
+        state["international_match"] = None
+        state["suppress_product_cards"] = True
+        state["pipeline_path"] = "followup_no_search"
+        return state
 
     products, intl_ctx, path = resolve_products_for_query(
         db=db,
@@ -172,6 +201,7 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
     state["international_context"] = intl_ctx
     state["international_match"] = {"context_only": True} if intl_ctx else None
     state["pipeline_path"] = path
+    state["suppress_product_cards"] = False
     logger.info(
         "[GRAPH] product_search done | path=%s shopify_products=%s titles=%s",
         path, len(products), [(p.get("title") or "")[:30] for p in products[:5]],
@@ -185,12 +215,21 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
     so both produce identical prompts."""
     products = state.get("shopify_products") or []
     is_comparison = state.get("pipeline_path") == "comparison"
+    intent_detail = state.get("intent_detail") or {}
+    # Only expose gender to the LLM when the customer actually asked about it.
+    # Otherwise the model parrots the retrieved "Genre" field onto generic
+    # queries — e.g. answering "best perfume" with "voici des parfums pour
+    # femme" — an assumption the user never made.
+    gender_requested = bool((intent_detail.get("gender_preference") or "").strip())
+
     products_ctx = ""
     for i, p in enumerate(products[:5], 1):
         note_info = ", ".join(filter(None, [
             p.get("top_note"), p.get("heart_note"), p.get("base_note"), p.get("olfactive"),
         ]))
-        gender_line = f"   Genre: {p['gender']}\n" if p.get("gender") else ""
+        gender_line = ""
+        if gender_requested and p.get("gender"):
+            gender_line = f"   Genre: {p['gender']}\n"
         # Notes alone don't cover attribute questions (allergies, sensitive
         # skin, longevity, season/occasion, gift-worthiness) — those live in
         # free-text description, which used to only appear when notes were
@@ -210,7 +249,25 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
     for m in (state.get("history") or [])[-4:]:
         history_text += f"{m.get('role', 'user')}: {m.get('content', '')[:200]}\n"
 
-    return {
+    # Path-specific response-style guidance.
+    pipeline_path = state.get("pipeline_path", "")
+    if pipeline_path in ("intl_sql_match", "intl_pinecone_fallback"):
+        response_mode_directive = (
+            "Ces produits sont des correspondances de profil olfactif issues de notre collection "
+            "(PAS le parfum international lui-même, qui n'est jamais en vente ici) — présente-les avec une "
+            "formulation naturelle et varie ta phrase, par exemple dans l'esprit de : « Voici quelques parfums "
+            "de notre collection qui correspondent bien au profil olfactif recherché. »"
+        )
+    elif state.get("suppress_product_cards"):
+        response_mode_directive = (
+            "Le client pose une question de suivi sur un parfum déjà présenté plus haut dans la conversation — "
+            "ce n'est PAS une nouvelle recommandation. Réponds directement à sa question sans re-présenter ni "
+            "relister les produits (leurs fiches ne seront pas réaffichées)."
+        )
+    else:
+        response_mode_directive = ""
+
+    inputs = {
         "brand_name": state.get("brand_name", "Assistant"),
         "store_name": state.get("store_name", state.get("shop", "")),
         "tone": state.get("tone", "professional"),
@@ -221,7 +278,23 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
         "products_context": products_ctx or "Aucun produit spécifique trouvé.",
         "knowledge_context": state.get("knowledge_context", ""),
         "history": history_text,
+        # Explicit directive injected into the prompt so the model knows whether
+        # gender framing is allowed for THIS query.
+        "gender_directive": (
+            "Le client a précisé un genre — tu peux en tenir compte."
+            if gender_requested else
+            "Le client n'a PAS précisé de genre : ne catégorise PAS les parfums par genre "
+            "(n'écris jamais « pour femme / pour homme / mixte »). Recommande-les simplement."
+        ),
+        "response_mode_directive": response_mode_directive,
     }
+    logger.info(
+        "[GRAPH] build_generate_chain_inputs | products=%s gender_requested=%s comparison=%s "
+        "pipeline_path=%s suppress_cards=%s",
+        len(products), gender_requested, is_comparison,
+        pipeline_path, state.get("suppress_product_cards"),
+    )
+    return inputs
 
 
 def finalize_answer(state: ChatGraphState, message_text: str) -> dict:
@@ -230,7 +303,13 @@ def finalize_answer(state: ChatGraphState, message_text: str) -> dict:
     the prompt instructs the LLM not to restate price/URL, since those are
     only ever rendered in the product cards below the message."""
     products = state.get("shopify_products") or []
-    show_products = bool(products) and state.get("intent") not in POLICY_INTENTS
+    # Follow-up questions about an already-shown product reuse it as answer
+    # context but must NOT re-render cards that are already on screen.
+    show_products = (
+        bool(products)
+        and state.get("intent") not in POLICY_INTENTS
+        and not state.get("suppress_product_cards")
+    )
     resp_type = intent_to_response_type(state.get("intent", "general"))
 
     return {

@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy.orm import Session
 
-from app.core.config import INTERNATIONAL_MATCH_THRESHOLD, SHOPIFY_DIRECT_MATCH_THRESHOLD
+from app.core.config import INTERNATIONAL_MATCH_THRESHOLD
 from app.models.main_database import UnifiedProduct
 from app.rag.constants import SOURCE_INTERNATIONAL, SOURCE_SHOPIFY
 from app.rag.embeddings import embed_query
@@ -31,6 +31,27 @@ def _fmt_hits(hits: list[dict], limit: int = 8) -> str:
         )
     extra = f" (+{len(hits) - limit} more)" if len(hits) > limit else ""
     return "[" + ", ".join(parts) + "]" + extra
+
+
+def _log_semantic_search_results(query: str, shop_hits: list[dict], intl_hits: list[dict]) -> None:
+    """Grouped, human-readable dump of both semantic search pools — makes it
+    trivial to see whether a given query is landing on Shopify or
+    International products, and which specific ones, without piecing it
+    together from several one-line logs."""
+    lines = [f"[RAG] Semantic Search Results | query={query!r}", "  Shopify:"]
+    if shop_hits:
+        for i, h in enumerate(shop_hits, 1):
+            lines.append(f"    {i}. {h.get('title', '')} — Score: {round(h.get('score') or 0, 3)}")
+    else:
+        lines.append("    (none)")
+    lines.append("  International/Brand:")
+    if intl_hits:
+        for i, h in enumerate(intl_hits, 1):
+            lines.append(f"    {i}. {h.get('title', '')} — Score: {round(h.get('score') or 0, 3)}")
+    else:
+        lines.append("    (none)")
+    lines.append(f"  Summary: Shopify={len(shop_hits)}  International={len(intl_hits)}")
+    logger.info("\n".join(lines))
 
 
 def _newest_shopify_products(
@@ -62,6 +83,7 @@ def _newest_shopify_products(
             | (UnifiedProduct.gender == "")
         )
     rows = q.order_by(UnifiedProduct.updated_at.desc()).limit(top_k).all()
+    logger.info("[RAG] _newest_shopify_products | %s rows (gender=%s price=[%s,%s])", len(rows), gender, min_price, max_price)
     return unified_to_widget_products(db, rows, store_base_url)
 
 
@@ -73,6 +95,7 @@ def _compare_products(
     separated card for each side of the comparison instead of a single
     merged top-k list it has to guess how to split."""
     names = [n for n in names if n][:2]
+    logger.info("[RAG] _compare_products | names=%s", names)
     if len(names) < 2:
         return []
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -142,118 +165,126 @@ def resolve_products_for_query(
     # OpenAI embeddings call for the same text.
     query_vector = embed_query(embeddings, query)
 
-    # ── Step 1: Direct Shopify semantic search — run in parallel with the
-    # international reference search unless this is purely an own-product
-    # lookup (which never needs the international index). Both are
-    # independent Pinecone calls, so there's no reason to serialize them
-    # while we don't yet know which branch we'll end up needing. ──────────
+    # ── Own-product lookups never need the international index at all — skip
+    # it entirely rather than searching and discarding the result. ─────────
     if is_own:
+        logger.info("[RAG] own-product query — searching Shopify only, skipping international index")
         shop_hits = search_shopify_products(
             index, embeddings, query, store_base_url,
             shop=shop, top_k=8, vector=query_vector, gender=gender,
             min_price=min_price, max_price=max_price,
         )
-        intl_hits: list[dict] = []
+        logger.info("[RAG] Notes matching SKIPPED (own-product query)")
+        top = shop_hits[:3]
+        logger.info("[RAG] -> own_product | final products selected: %s", len(top))
+        return top, "", "own_product"
+
+    # ── Semantic search: Shopify + International in parallel ──────────────
+    logger.info("[RAG] Semantic search started | query=%r", query)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        shop_future = pool.submit(
+            search_shopify_products, index, embeddings, query, store_base_url,
+            shop=shop, top_k=8, vector=query_vector, gender=gender,
+            min_price=min_price, max_price=max_price,
+        )
+        intl_future = pool.submit(
+            search_international, index, embeddings, query, store_base_url,
+            top_k=5, vector=query_vector, gender=gender,
+        )
+        shop_hits = shop_future.result()
+        intl_hits = intl_future.result()
+    logger.info("[RAG] Semantic search completed")
+    _log_semantic_search_results(query, shop_hits, intl_hits)
+
+    # ── Rank BOTH pools together and look at what's actually #1 overall —
+    # not "does Shopify clear a fixed score threshold" but "which single
+    # product, Shopify or International, is the closest semantic match".
+    # Case 1 (top = Shopify): use it directly, no note-matching needed.
+    # Case 2 (top = International): note-match it against the Shopify
+    # catalog and return ONLY the matched Shopify products. ────────────────
+    merged = sorted(shop_hits + intl_hits, key=lambda h: h.get("score") or 0, reverse=True)
+    top = merged[0] if merged else None
+    if top:
+        logger.info(
+            "[RAG] Top result identified | %r (source=%s, score=%s)",
+            top.get("title"), top.get("source_type"), round(top.get("score") or 0, 3),
+        )
     else:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            shop_future = pool.submit(
-                search_shopify_products, index, embeddings, query, store_base_url,
-                shop=shop, top_k=8, vector=query_vector, gender=gender,
-                min_price=min_price, max_price=max_price,
-            )
-            intl_future = pool.submit(
-                search_international, index, embeddings, query, store_base_url,
-                top_k=3, vector=query_vector, gender=gender,
-            )
-            shop_hits = shop_future.result()
-            intl_hits = intl_future.result()
+        logger.info("[RAG] Top result identified | none — both pools empty")
+        logger.info("[RAG] -> no_results | final products selected: 0")
+        return [], "", "no_results"
 
-    top_score = (shop_hits[0].get("score") or 0) if shop_hits else 0
-    direct_match = bool(shop_hits) and top_score >= SHOPIFY_DIRECT_MATCH_THRESHOLD
+    if top.get("source_type") == SOURCE_SHOPIFY:
+        logger.info("[RAG] Notes matching SKIPPED — top semantic result is already a Shopify product")
+        final = shop_hits[:5]
+        logger.info("[RAG] -> shopify_direct | final products selected: %s", len(final))
+        return final, "", "shopify_direct"
+
+    # Top result is International. Pinecone always returns a nearest
+    # neighbor even when nothing is truly relevant — only trust it as "the
+    # perfume the customer means" when they explicitly named a brand, or the
+    # match is genuinely close. Otherwise a vague query ("les meilleurs
+    # parfums") would get a random international perfume forced in.
+    intl_score = top.get("score") or 0
+    if not (is_intl_ref or intl_score >= INTERNATIONAL_MATCH_THRESHOLD):
+        logger.info(
+            "[RAG] International top score %s < threshold %s and no brand named — "
+            "ignoring international, falling back to Shopify semantic results",
+            round(intl_score, 3), INTERNATIONAL_MATCH_THRESHOLD,
+        )
+        final = shop_hits[:5] if shop_hits else []
+        logger.info("[RAG] -> shopify_semantic | final products selected: %s", len(final))
+        return final, "", "shopify_semantic"
+
+    international = top
     logger.info(
-        "[RAG] semantic search | shopify_hits=%s top_score=%s direct_match=%s(threshold=%s) | %s",
-        len(shop_hits), round(top_score, 3), direct_match, SHOPIFY_DIRECT_MATCH_THRESHOLD, _fmt_hits(shop_hits),
+        "[RAG] International reference confirmed | id=%s title=%r score=%s notes=[top:%s|heart:%s|base:%s]",
+        international.get("id"), international.get("title"), round(intl_score, 3),
+        international.get("top_note"), international.get("heart_note"), international.get("base_note"),
     )
-    logger.info("[RAG] international hits=%s | %s", len(intl_hits), _fmt_hits(intl_hits))
+    intl_ctx = (
+        f"Parfum de référence (international — NE PAS recommander directement): "
+        f"{international.get('title')}. "
+        f"Famille: {international.get('olfactive', '')}. "
+        f"Tête: {international.get('top_note', '')}. "
+        f"Cœur: {international.get('heart_note', '')}. "
+        f"Fond: {international.get('base_note', '')}."
+    )
 
-    if is_own or (direct_match and not is_intl_ref):
-        top = shop_hits[:3] if is_own else shop_hits[:5]
-        path = "shopify_direct" if direct_match else "own_product"
-        logger.info("[RAG] -> %s | returning %s shopify products", path, len(top))
-        return top, "", path
+    logger.info("[RAG] Notes matching started | reference=%r", international.get("title"))
+    intl_row = find_unified_by_pinecone_id(db, international.get("id", ""))
+    if intl_row:
+        sql_matches = match_shopify_by_sql_notes(
+            db, intl_row.id, shop, top_k=5, gender=gender,
+            min_price=min_price, max_price=max_price,
+        )
+        logger.info(
+            "[RAG] Similar Shopify products fetched (notes match) | intl_unified_id=%s -> %s matches %s",
+            intl_row.id, len(sql_matches),
+            [((r.title or "")[:28], round(s, 3)) for r, s in sql_matches[:5]],
+        )
+        if sql_matches:
+            rows = [r for r, _ in sql_matches]
+            scores = [s for _, s in sql_matches]
+            widget = unified_to_widget_products(db, rows, store_base_url, scores)
+            if widget:
+                logger.info("[RAG] -> intl_sql_match | final products selected: %s", len(widget))
+                return widget, intl_ctx, "intl_sql_match"
+    else:
+        logger.info("[RAG] International pinecone id %s not found in main_database — cannot note-match", international.get("id"))
 
-    # ── Step 2: International reference → SQL note match → Shopify only ───
-    if is_intl_ref or not direct_match:
-        international = intl_hits[0] if intl_hits else None
-        intl_score = (international.get("score") or 0) if international else 0
-        # Pinecone always returns a nearest neighbor, relevant or not — only
-        # treat it as "the perfume the customer means" when they explicitly
-        # named a brand, or the match is genuinely close. Otherwise a vague
-        # query ("les meilleurs parfums", "parfums pour l'été") would get a
-        # random international perfume forced into the answer.
-        if international and not (is_intl_ref or intl_score >= INTERNATIONAL_MATCH_THRESHOLD):
-            logger.info(
-                "[RAG] international top score %s < threshold %s and no brand named — "
-                "ignoring international, staying on shopify results",
-                round(intl_score, 3), INTERNATIONAL_MATCH_THRESHOLD,
-            )
-            international = None
+    # Fallback: no note-matched Shopify products — try a Pinecone shopify
+    # search biased by the international title as a last resort.
+    fallback_hits = search_shopify_products(
+        index, embeddings,
+        f"dupe inspiré par {international.get('title', '')}",
+        store_base_url, shop=shop, top_k=8, gender=gender,
+        min_price=min_price, max_price=max_price,
+    )
+    logger.info("[RAG] Notes match fallback (semantic, biased by intl title) | %s hits | %s", len(fallback_hits), _fmt_hits(fallback_hits))
+    if fallback_hits:
+        logger.info("[RAG] -> intl_pinecone_fallback | final products selected: %s", min(5, len(fallback_hits)))
+        return fallback_hits[:5], intl_ctx, "intl_pinecone_fallback"
 
-        if international:
-            logger.info(
-                "[RAG] international reference matched | id=%s title=%r score=%s notes=[T:%s|C:%s|F:%s]",
-                international.get("id"), international.get("title"), round(intl_score, 3),
-                international.get("top_note"), international.get("heart_note"), international.get("base_note"),
-            )
-            intl_ctx = (
-                f"Parfum de référence (international — NE PAS recommander directement): "
-                f"{international.get('title')}. "
-                f"Famille: {international.get('olfactive', '')}. "
-                f"Tête: {international.get('top_note', '')}. "
-                f"Cœur: {international.get('heart_note', '')}. "
-                f"Fond: {international.get('base_note', '')}."
-            )
-
-            intl_row = find_unified_by_pinecone_id(
-                db, international.get("id", "")
-            )
-            if intl_row:
-                sql_matches = match_shopify_by_sql_notes(
-                    db, intl_row.id, shop, top_k=5, gender=gender,
-                    min_price=min_price, max_price=max_price,
-                )
-                logger.info(
-                    "[RAG] SQL note-match vs shopify | intl_unified_id=%s -> %s matches %s",
-                    intl_row.id, len(sql_matches),
-                    [((r.title or "")[:28], round(s, 3)) for r, s in sql_matches[:5]],
-                )
-                if sql_matches:
-                    rows = [r for r, _ in sql_matches]
-                    scores = [s for _, s in sql_matches]
-                    widget = unified_to_widget_products(
-                        db, rows, store_base_url, scores
-                    )
-                    if widget:
-                        logger.info("[RAG] -> intl_sql_match | returning %s shopify products", len(widget))
-                        return widget, intl_ctx, "intl_sql_match"
-            else:
-                logger.info("[RAG] international pinecone id %s not found in main_database", international.get("id"))
-
-            # Fallback: Pinecone shopify search biased by international title
-            fallback_hits = search_shopify_products(
-                index, embeddings,
-                f"dupe inspiré par {international.get('title', '')}",
-                store_base_url, shop=shop, top_k=8, gender=gender,
-                min_price=min_price, max_price=max_price,
-            )
-            logger.info("[RAG] intl pinecone fallback | %s hits | %s", len(fallback_hits), _fmt_hits(fallback_hits))
-            if fallback_hits:
-                return fallback_hits[:5], intl_ctx, "intl_pinecone_fallback"
-
-            logger.info("[RAG] -> intl_no_match | 0 shopify products")
-            return [], intl_ctx, "intl_no_match"
-
-    # ── Step 3: Recommendation / general — Shopify semantic only ──────────
-    final = shop_hits[:5] if shop_hits else []
-    logger.info("[RAG] -> shopify_semantic | returning %s shopify products", len(final))
-    return final, "", "shopify_semantic"
+    logger.info("[RAG] -> intl_no_match | final products selected: 0")
+    return [], intl_ctx, "intl_no_match"

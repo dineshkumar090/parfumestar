@@ -1,6 +1,7 @@
 """LangChain structured intent classification."""
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -9,6 +10,8 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from app.rag.constants import ChatIntent
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class IntentClassification(BaseModel):
@@ -48,6 +51,15 @@ class IntentClassification(BaseModel):
         default=False,
         description="True if the customer explicitly asks for the newest/latest arrivals",
     )
+    skip_product_search: bool = Field(
+        default=False,
+        description=(
+            "True ONLY if this question is about a product already shown/discussed earlier "
+            "in this conversation (asking about ITS usage, longevity, season suitability, "
+            "EDT vs EDP, ingredients, etc.) rather than asking to find/recommend a product. "
+            "False (default) for anything that should trigger a new product search."
+        ),
+    )
     order_id: str | None = Field(default=None)
     needs_escalation: bool = Field(default=False)
     escalation_reason: str = Field(default="")
@@ -80,6 +92,12 @@ Règles:
   liste les 2 noms. Sinon liste vide.
 - needs_ingredient_info=true pour toute question sur allergies, ingrédients, composition, peau sensible.
 - is_newest_query=true pour "nouveautés", "derniers parfums sortis", "dernières sorties", "nouveaux produits".
+- skip_product_search=true UNIQUEMENT si le client pose une question de suivi sur un parfum DÉJÀ montré/mentionné
+  plus haut dans la conversation (regarde "Products currently shown" et l'historique) — ex: "comment l'appliquer ?",
+  "combien de temps ça tient ?", "c'est bien pour l'été ?", "quelle est la différence entre EDT et EDP ?",
+  "il contient quoi ?" en référence à un produit déjà discuté. Dans ce cas, intent=product_knowledge_query et
+  skip_product_search=true — ce n'est PAS une nouvelle recherche de produit. Si le client demande de nouveaux
+  produits, une comparaison avec un produit non montré, ou toute recommandation, skip_product_search=false.
 
 Réponds en JSON valide uniquement."""
 
@@ -107,6 +125,7 @@ def classify_intent(
     user_msg = f"{history_text}{shown}\nCurrent message: {query}"
 
     result: IntentClassification | None = None
+    method = None
     try:
         structured_result = structured.invoke([
             SystemMessage(content=INTENT_SYSTEM_PROMPT),
@@ -114,8 +133,9 @@ def classify_intent(
         ])
         if isinstance(structured_result, IntentClassification):
             result = structured_result
+            method = "structured_output(function_call)"
     except Exception as e:
-        print(f"[INTENT] structured output failed: {e}")
+        logger.warning("[INTENT] structured output failed, falling back: %s", e)
 
     if result is None:
         # Fallback: raw JSON parse
@@ -129,11 +149,13 @@ def classify_intent(
                 raw = raw.split("```")[1].replace("json", "").strip()
             data = json.loads(raw)
             result = IntentClassification(**data)
+            method = "raw_json_fallback"
         except Exception:
             pass
 
     if result is None:
         # Heuristic fallback
+        method = "heuristic_fallback"
         q = query.lower()
         gender = _heuristic_gender(q)
         min_price, max_price = _heuristic_price_range(q)
@@ -171,6 +193,13 @@ def classify_intent(
     if not result.is_newest_query and _heuristic_is_newest(q_lower):
         result.is_newest_query = True
 
+    logger.info(
+        "[INTENT] classify_intent(query=%r) via %s -> intent=%s conf=%s intl_ref=%s own=%s gender=%r "
+        "price=[%s,%s] compare=%s newest=%s skip_product_search=%s",
+        query, method, result.intent, result.confidence, result.is_international_reference,
+        result.is_own_product, result.gender_preference, result.min_price, result.max_price,
+        result.compare_products, result.is_newest_query, result.skip_product_search,
+    )
     return result
 
 

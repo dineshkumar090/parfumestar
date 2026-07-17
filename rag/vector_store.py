@@ -126,6 +126,7 @@ def search_international(
     vector: list[float] | None = None,
     gender: str | None = None,
 ) -> list[dict[str, Any]]:
+    logger.info("[SEARCH] search_international(query=%r, top_k=%s, gender=%s)", query, top_k, gender)
     base_filt: dict = {"source_type": {"$eq": SOURCE_INTERNATIONAL}}
     gender_clause = _gender_clause(gender)
     filt = {"$and": [base_filt, gender_clause]} if gender_clause else base_filt
@@ -138,6 +139,7 @@ def search_international(
         # no `gender` field at all, so Pinecone excludes them from any
         # filter referencing it — fall back to an unfiltered search rather
         # than showing the customer nothing.
+        logger.info("[SEARCH] international: 0 hits with gender filter — retrying without gender")
         hits = semantic_search(
             index, embeddings, query, store_base_url,
             top_k=top_k, metadata_filter=base_filt, vector=vector,
@@ -166,6 +168,10 @@ def search_shopify_products(
     min_price: float | None = None,
     max_price: float | None = None,
 ) -> list[dict[str, Any]]:
+    logger.info(
+        "[SEARCH] search_shopify_products(query=%r, shop=%s, top_k=%s, gender=%s, price=[%s,%s])",
+        query, shop, top_k, gender, min_price, max_price,
+    )
     # Filter by `shop` (which uniquely identifies this store's Shopify products
     # — international reference vectors carry no `shop` field) rather than by
     # `source_type`. Some already-embedded vectors were written WITHOUT a
@@ -189,6 +195,7 @@ def search_shopify_products(
         top_k=top_k, metadata_filter=filt, vector=vector,
     )
     if not hits and gender_clause:
+        logger.info("[SEARCH] shopify: 0 hits with gender filter — retrying without gender")
         hits = semantic_search(
             index, embeddings, query, store_base_url,
             top_k=top_k, metadata_filter=base_filt, vector=vector,

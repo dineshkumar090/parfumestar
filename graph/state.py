@@ -36,6 +36,7 @@ class ChatGraphState(TypedDict, total=False):
     knowledge_context: str
     international_context: str
     pipeline_path: str
+    suppress_product_cards: bool  # True for follow-up answers reusing already-shown products
 
     # Output
     answer: dict
