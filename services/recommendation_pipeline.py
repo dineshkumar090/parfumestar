@@ -15,6 +15,7 @@ from app.rag.vector_store import search_international, search_shopify_products
 from app.services.note_matcher import (
     find_unified_by_pinecone_id,
     match_shopify_by_sql_notes,
+    shopify_products_from_curated_links,
     unified_to_widget_products,
 )
 
@@ -196,17 +197,28 @@ def resolve_products_for_query(
     logger.info("[RAG] Semantic search completed")
     _log_semantic_search_results(query, shop_hits, intl_hits)
 
-    # ── Rank BOTH pools together and look at what's actually #1 overall —
-    # not "does Shopify clear a fixed score threshold" but "which single
-    # product, Shopify or International, is the closest semantic match".
-    # Case 1 (top = Shopify): use it directly, no note-matching needed.
-    # Case 2 (top = International): note-match it against the Shopify
-    # catalog and return ONLY the matched Shopify products. ────────────────
+    # ── Rank BOTH pools together and log what's #1 overall for visibility —
+    # but the decision itself is NOT purely "whichever raw score wins".
+    #
+    # Why: a Shopify "dupe inspiré par Dior Sauvage" product's own marketing
+    # copy names the brand, which can make IT out-score the actual Dior
+    # Sauvage reference vector on raw cosine similarity. Blindly trusting the
+    # merged top-1 in that case skips notes-matching and returns whatever
+    # Shopify hit happened to win — not necessarily the best-matching product,
+    # just the one whose description text overlapped most with the query.
+    #
+    # So: when the classifier explicitly detected a named brand/reference
+    # (is_intl_ref), we ALWAYS resolve via the international pool's own top
+    # hit and note-match from there — that's the whole point of a brand
+    # query on a store that only sells its own dupes. The raw-score merge is
+    # only the deciding factor when NO brand was named (generic queries),
+    # where "top result happens to be Shopify" legitimately means skip the
+    # unnecessary notes-matching step. ──────────────────────────────────────
     merged = sorted(shop_hits + intl_hits, key=lambda h: h.get("score") or 0, reverse=True)
     top = merged[0] if merged else None
     if top:
         logger.info(
-            "[RAG] Top result identified | %r (source=%s, score=%s)",
+            "[RAG] Top result identified (merged rank) | %r (source=%s, score=%s)",
             top.get("title"), top.get("source_type"), round(top.get("score") or 0, 3),
         )
     else:
@@ -214,29 +226,40 @@ def resolve_products_for_query(
         logger.info("[RAG] -> no_results | final products selected: 0")
         return [], "", "no_results"
 
-    if top.get("source_type") == SOURCE_SHOPIFY:
-        logger.info("[RAG] Notes matching SKIPPED — top semantic result is already a Shopify product")
+    if is_intl_ref:
+        logger.info(
+            "[RAG] Explicit brand/reference detected by classifier — resolving via international "
+            "pool's own top hit regardless of merged-rank winner"
+        )
+        if not intl_hits:
+            logger.info("[RAG] ...but international pool is empty — falling back to Shopify semantic results")
+            final = shop_hits[:5] if shop_hits else []
+            logger.info("[RAG] -> shopify_semantic | final products selected: %s", len(final))
+            return final, "", "shopify_semantic"
+        international = intl_hits[0]
+        intl_score = international.get("score") or 0
+    elif top.get("source_type") == SOURCE_SHOPIFY:
+        logger.info("[RAG] Notes matching SKIPPED — no brand named, and top semantic result is already a Shopify product")
         final = shop_hits[:5]
         logger.info("[RAG] -> shopify_direct | final products selected: %s", len(final))
         return final, "", "shopify_direct"
-
-    # Top result is International. Pinecone always returns a nearest
-    # neighbor even when nothing is truly relevant — only trust it as "the
-    # perfume the customer means" when they explicitly named a brand, or the
-    # match is genuinely close. Otherwise a vague query ("les meilleurs
-    # parfums") would get a random international perfume forced in.
-    intl_score = top.get("score") or 0
-    if not (is_intl_ref or intl_score >= INTERNATIONAL_MATCH_THRESHOLD):
-        logger.info(
-            "[RAG] International top score %s < threshold %s and no brand named — "
-            "ignoring international, falling back to Shopify semantic results",
-            round(intl_score, 3), INTERNATIONAL_MATCH_THRESHOLD,
-        )
-        final = shop_hits[:5] if shop_hits else []
-        logger.info("[RAG] -> shopify_semantic | final products selected: %s", len(final))
-        return final, "", "shopify_semantic"
-
-    international = top
+    else:
+        # Top result is International despite no explicit brand mention.
+        # Pinecone always returns a nearest neighbor even when nothing is
+        # truly relevant — only trust it if the match is genuinely close.
+        # Otherwise a vague query ("les meilleurs parfums") would get a
+        # random international perfume forced in.
+        intl_score = top.get("score") or 0
+        if intl_score < INTERNATIONAL_MATCH_THRESHOLD:
+            logger.info(
+                "[RAG] International top score %s < threshold %s and no brand named — "
+                "ignoring international, falling back to Shopify semantic results",
+                round(intl_score, 3), INTERNATIONAL_MATCH_THRESHOLD,
+            )
+            final = shop_hits[:5] if shop_hits else []
+            logger.info("[RAG] -> shopify_semantic | final products selected: %s", len(final))
+            return final, "", "shopify_semantic"
+        international = top
     logger.info(
         "[RAG] International reference confirmed | id=%s title=%r score=%s notes=[top:%s|heart:%s|base:%s]",
         international.get("id"), international.get("title"), round(intl_score, 3),
@@ -254,6 +277,19 @@ def resolve_products_for_query(
     logger.info("[RAG] Notes matching started | reference=%r", international.get("title"))
     intl_row = find_unified_by_pinecone_id(db, international.get("id", ""))
     if intl_row:
+        # Priority 1: the source international DB ships a hand-curated
+        # "these are the exact Shopify dupes" mapping for this product — real
+        # ground truth, not a note-overlap heuristic. Always prefer it when
+        # it names products that are actually active/enabled in this shop's
+        # catalog right now.
+        curated = shopify_products_from_curated_links(db, intl_row, shop, store_base_url)
+        if curated:
+            logger.info("[RAG] -> intl_curated_match | final products selected: %s", len(curated))
+            return curated[:5], intl_ctx, "intl_curated_match"
+
+        # Priority 2: automated fragrance-note overlap against the Shopify
+        # catalog, for international products with no curated mapping (or
+        # whose curated picks are no longer active/enabled).
         sql_matches = match_shopify_by_sql_notes(
             db, intl_row.id, shop, top_k=5, gender=gender,
             min_price=min_price, max_price=max_price,

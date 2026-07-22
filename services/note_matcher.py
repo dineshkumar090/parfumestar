@@ -36,6 +36,55 @@ def find_unified_by_pinecone_id(db: Session, pinecone_id: str) -> UnifiedProduct
     return row
 
 
+def _shopify_id_from_gid(gid: str | None) -> str | None:
+    """'gid://shopify/Product/9991582089562' -> '9991582089562'."""
+    if not gid:
+        return None
+    tail = gid.rsplit("/", 1)[-1]
+    return tail if tail.isdigit() else None
+
+
+def shopify_products_from_curated_links(
+    db: Session, intl_row: UnifiedProduct, shop: str, store_base_url: str,
+) -> list[dict]:
+    """The international source DB (product_recoms) ships a hand-curated
+    `is_recommended` field naming the exact Shopify dupe(s) for each
+    international perfume — real ground truth, not a heuristic. It's synced
+    into UnifiedProduct.linked_shopify_products but was never read back
+    during chat, leaving the chatbot to rely solely on automated note-overlap
+    matching even when the authoritative answer was already sitting in the
+    DB. This looks it up and returns those exact products (still scoped to
+    this shop and still requiring them to be active + AI-enabled)."""
+    links = intl_row.linked_shopify_products
+    if not isinstance(links, list) or not links:
+        logger.info("[NOTES] curated links | unified %s has none", intl_row.id)
+        return []
+
+    shopify_ids = [sid for sid in (_shopify_id_from_gid(l.get("productId")) for l in links) if sid]
+    logger.info(
+        "[NOTES] curated links | unified %s -> %s candidate shopify_id(s): %s",
+        intl_row.id, len(shopify_ids), shopify_ids,
+    )
+    if not shopify_ids:
+        return []
+
+    rows = db.query(UnifiedProduct).filter(
+        UnifiedProduct.source_type == SOURCE_SHOPIFY,
+        UnifiedProduct.shop_url == shop,
+        UnifiedProduct.source_id.in_(shopify_ids),
+        UnifiedProduct.is_enabled == 1,
+    ).all()
+    # Preserve the curator's original ranking (recomProduct1 first, etc.)
+    # rather than whatever order the SQL IN() clause happens to return.
+    order = {sid: i for i, sid in enumerate(shopify_ids)}
+    rows.sort(key=lambda r: order.get(r.source_id, len(shopify_ids)))
+    logger.info(
+        "[NOTES] curated links | %s/%s candidates are active+enabled in this shop's catalog: %s",
+        len(rows), len(shopify_ids), [(r.source_id, (r.title or "")[:28]) for r in rows],
+    )
+    return unified_to_widget_products(db, rows, store_base_url)
+
+
 def _notes_by_type(db: Session, unified_product_id: int) -> dict[str, list[str]]:
     """All notes for a product grouped by note_type — for logging visibility."""
     grouped: dict[str, list[str]] = {}
