@@ -66,6 +66,19 @@ SYNC_EMBED_CONCURRENCY = int(os.getenv("SYNC_EMBED_CONCURRENCY", "8"))
 # forced into the answer as if the customer had asked about it specifically.
 INTERNATIONAL_MATCH_THRESHOLD = float(os.getenv("INTERNATIONAL_MATCH_THRESHOLD", "0.72"))
 
+# Minimum weighted fragrance-note similarity (0-1, category-weighted Jaccard
+# across top/heart/base/olfactive) for a Shopify product to be presented as a
+# note-matched "dupe". Below this, e.g. a single incidental shared note out
+# of 15+ total notes, the automated SQL note match is too weak to trust —
+# fall back to a semantic Pinecone search instead of confidently recommending
+# a poor match.
+NOTES_MATCH_MIN_SIMILARITY = float(os.getenv("NOTES_MATCH_MIN_SIMILARITY", "0.18"))
+
+# How many Shopify candidates (sharing >=1 note with the reference) to pull
+# in for weighted scoring. A broad-ish net so the true best match isn't
+# missed, capped for query performance on large catalogs.
+NOTES_MATCH_CANDIDATE_POOL = int(os.getenv("NOTES_MATCH_CANDIDATE_POOL", "150"))
+
 
 def _mysql_uri(host, port, user, password, db) -> str:
     return f"mysql+pymysql://{user}:{password}@{host}:{port}/{db}?charset=utf8mb4"

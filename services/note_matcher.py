@@ -7,6 +7,7 @@ import logging
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.core.config import NOTES_MATCH_CANDIDATE_POOL, NOTES_MATCH_MIN_SIMILARITY
 from app.models.main_database import UnifiedProduct
 from app.models.perfume_notes import PerfumeNote
 from app.models.products import Product
@@ -14,6 +15,17 @@ from app.rag.constants import SOURCE_INTERNATIONAL, SOURCE_SHOPIFY
 from app.rag.vector_store import format_product_hit
 
 logger = logging.getLogger("uvicorn.error")
+
+# How much each note category contributes to the overall similarity score.
+# Heart notes define a fragrance's core character and are weighted highest;
+# top notes fade within minutes so they matter less; olfactive family
+# (Floral/Oriental/...) is a coarse but reliable category-level signal.
+_NOTE_TYPE_WEIGHTS: dict[str, float] = {
+    "heart": 0.35,
+    "top": 0.25,
+    "base": 0.25,
+    "olfactive": 0.15,
+}
 
 
 def find_unified_by_pinecone_id(db: Session, pinecone_id: str) -> UnifiedProduct | None:
@@ -44,17 +56,74 @@ def _shopify_id_from_gid(gid: str | None) -> str | None:
     return tail if tail.isdigit() else None
 
 
+def _notes_by_type(db: Session, unified_product_id: int) -> dict[str, set[str]]:
+    """A single product's notes grouped by note_type, as sets (for Jaccard)."""
+    grouped: dict[str, set[str]] = {}
+    for note_type, note_name in db.query(
+        PerfumeNote.note_type, PerfumeNote.note_name
+    ).filter(PerfumeNote.unified_product_id == unified_product_id).all():
+        grouped.setdefault(note_type, set()).add(note_name)
+    return grouped
+
+
+def _notes_by_type_bulk(db: Session, unified_product_ids: list[int]) -> dict[int, dict[str, set[str]]]:
+    """Same as _notes_by_type but for many products in one query — avoids an
+    N+1 query pattern when scoring a whole candidate pool."""
+    if not unified_product_ids:
+        return {}
+    grouped: dict[int, dict[str, set[str]]] = {}
+    rows = db.query(
+        PerfumeNote.unified_product_id, PerfumeNote.note_type, PerfumeNote.note_name
+    ).filter(PerfumeNote.unified_product_id.in_(unified_product_ids)).all()
+    for pid, note_type, note_name in rows:
+        grouped.setdefault(pid, {}).setdefault(note_type, set()).add(note_name)
+    return grouped
+
+
+def weighted_note_similarity(
+    ref_by_type: dict[str, set[str]], cand_by_type: dict[str, set[str]],
+) -> tuple[float, dict[str, tuple[int, int, float]]]:
+    """Category-weighted Jaccard similarity between two products' notes.
+
+    Matches COMPLETE normalized notes only (set membership — never substring
+    or character-level comparison), so "abricot" can never accidentally
+    match "abri". Each category (top/heart/base/olfactive) contributes
+    intersection/union scaled by its weight; categories absent from both
+    sides are excluded from the denominator so a product with no
+    olfactive-family data isn't unfairly penalized relative to one that has
+    it. Returns (overall 0-1 score, {category: (intersection, union, cat_score)})
+    for transparent logging/debugging of exactly why a score came out the
+    way it did."""
+    total_weight = 0.0
+    weighted_sum = 0.0
+    breakdown: dict[str, tuple[int, int, float]] = {}
+    for note_type, weight in _NOTE_TYPE_WEIGHTS.items():
+        ref_set = ref_by_type.get(note_type, set())
+        cand_set = cand_by_type.get(note_type, set())
+        if not ref_set and not cand_set:
+            continue
+        inter = len(ref_set & cand_set)
+        union = len(ref_set | cand_set)
+        cat_score = (inter / union) if union else 0.0
+        breakdown[note_type] = (inter, union, cat_score)
+        total_weight += weight
+        weighted_sum += weight * cat_score
+    overall = (weighted_sum / total_weight) if total_weight else 0.0
+    return overall, breakdown
+
+
 def shopify_products_from_curated_links(
     db: Session, intl_row: UnifiedProduct, shop: str, store_base_url: str,
 ) -> list[dict]:
     """The international source DB (product_recoms) ships a hand-curated
     `is_recommended` field naming the exact Shopify dupe(s) for each
     international perfume — real ground truth, not a heuristic. It's synced
-    into UnifiedProduct.linked_shopify_products but was never read back
-    during chat, leaving the chatbot to rely solely on automated note-overlap
-    matching even when the authoritative answer was already sitting in the
-    DB. This looks it up and returns those exact products (still scoped to
-    this shop and still requiring them to be active + AI-enabled)."""
+    into UnifiedProduct.linked_shopify_products. This looks it up and returns
+    those exact products (still scoped to this shop and still requiring them
+    to be active + AI-enabled), each annotated with its ACTUAL note
+    similarity against the reference — computed, not assumed — so the
+    curated pick is shown with an honest confidence percentage rather than
+    silently implying a perfect match it may not have."""
     links = intl_row.linked_shopify_products
     if not isinstance(links, list) or not links:
         logger.info("[NOTES] curated links | unified %s has none", intl_row.id)
@@ -82,17 +151,21 @@ def shopify_products_from_curated_links(
         "[NOTES] curated links | %s/%s candidates are active+enabled in this shop's catalog: %s",
         len(rows), len(shopify_ids), [(r.source_id, (r.title or "")[:28]) for r in rows],
     )
-    return unified_to_widget_products(db, rows, store_base_url)
+    if not rows:
+        return []
 
-
-def _notes_by_type(db: Session, unified_product_id: int) -> dict[str, list[str]]:
-    """All notes for a product grouped by note_type — for logging visibility."""
-    grouped: dict[str, list[str]] = {}
-    for note_type, note_name in db.query(
-        PerfumeNote.note_type, PerfumeNote.note_name
-    ).filter(PerfumeNote.unified_product_id == unified_product_id).all():
-        grouped.setdefault(note_type, []).append(note_name)
-    return grouped
+    ref_by_type = _notes_by_type(db, intl_row.id)
+    cand_notes = _notes_by_type_bulk(db, [r.id for r in rows])
+    scores = []
+    for row in rows:
+        score, breakdown = weighted_note_similarity(ref_by_type, cand_notes.get(row.id, {}))
+        scores.append(score)
+        logger.info(
+            "[NOTES]   curated #%s %r | notes similarity=%.0f%% breakdown=%s",
+            row.id, (row.title or "")[:40], score * 100,
+            {k: f"{i}/{u}={c:.2f}" for k, (i, u, c) in breakdown.items()},
+        )
+    return unified_to_widget_products(db, rows, store_base_url, scores)
 
 
 def match_shopify_by_sql_notes(
@@ -103,34 +176,42 @@ def match_shopify_by_sql_notes(
     gender: str | None = None,
     min_price: float | None = None,
     max_price: float | None = None,
+    min_similarity: float = NOTES_MATCH_MIN_SIMILARITY,
 ) -> list[tuple[UnifiedProduct, float]]:
-    """
-    Find Shopify products with the most overlapping normalized notes.
-    Returns (UnifiedProduct, score) sorted by match count.
+    """Find the Shopify products whose fragrance notes are most similar to an
+    international reference product's.
+
+    Two-phase: (1) SQL generates a broad CANDIDATE pool — any Shopify product
+    sharing at least one normalized note with the reference, respecting
+    shop/gender/price/enabled filters — capped at NOTES_MATCH_CANDIDATE_POOL
+    for query performance; (2) full note sets (not just the overlapping
+    ones) are fetched in bulk and scored in Python with a proper
+    category-weighted Jaccard similarity (see weighted_note_similarity),
+    which is what actually determines ranking. The previous version ranked
+    candidates purely by raw overlap COUNT, ignoring note_type entirely and
+    with no floor — a product sharing 1 note out of 15 could still "win" if
+    it was the only candidate found. Results below min_similarity are
+    dropped rather than confidently presented as a match.
+
+    Returns (UnifiedProduct, similarity 0-1) sorted by similarity desc.
     """
     logger.info(
-        "[NOTES] match_shopify_by_sql_notes | intl_unified_id=%s shop=%s top_k=%s gender=%s price=[%s,%s]",
-        international_unified_id, shop, top_k, gender, min_price, max_price,
+        "[NOTES] match_shopify_by_sql_notes | intl_unified_id=%s shop=%s top_k=%s gender=%s "
+        "price=[%s,%s] min_similarity=%s",
+        international_unified_id, shop, top_k, gender, min_price, max_price, min_similarity,
     )
-    ref_note_names = [
-        r[0]
-        for r in db.query(PerfumeNote.note_name)
-        .filter(PerfumeNote.unified_product_id == international_unified_id)
-        .distinct()
-        .all()
-    ]
-    logger.info(
-        "[NOTES] reference (international) notes by type=%s | flat=%s",
-        _notes_by_type(db, international_unified_id), ref_note_names,
-    )
+    ref_by_type = _notes_by_type(db, international_unified_id)
+    ref_note_names = set().union(*ref_by_type.values()) if ref_by_type else set()
+    logger.info("[NOTES] reference (international) notes by type=%s", ref_by_type)
     if not ref_note_names:
         logger.info("[NOTES] international product has NO notes stored — cannot note-match")
         return []
 
-    query = (
+    # ── Phase 1: candidate generation (SQL) ────────────────────────────
+    candidate_q = (
         db.query(
             PerfumeNote.unified_product_id,
-            func.count(PerfumeNote.id).label("match_count"),
+            func.count(PerfumeNote.id).label("raw_overlap"),
         )
         .join(UnifiedProduct, UnifiedProduct.id == PerfumeNote.unified_product_id)
         .filter(
@@ -141,45 +222,69 @@ def match_shopify_by_sql_notes(
         )
     )
     if gender and gender != "mixte":
-        query = query.filter(
+        candidate_q = candidate_q.filter(
             (UnifiedProduct.gender == gender)
             | (UnifiedProduct.gender == "mixte")
             | (UnifiedProduct.gender.is_(None))
             | (UnifiedProduct.gender == "")
         )
     if min_price is not None:
-        query = query.filter(UnifiedProduct.price >= min_price)
+        candidate_q = candidate_q.filter(UnifiedProduct.price >= min_price)
     if max_price is not None:
-        query = query.filter(UnifiedProduct.price <= max_price)
+        candidate_q = candidate_q.filter(UnifiedProduct.price <= max_price)
 
-    rows = (
-        query
+    candidate_rows = (
+        candidate_q
         .group_by(PerfumeNote.unified_product_id)
         .order_by(func.count(PerfumeNote.id).desc())
-        .limit(top_k)
+        .limit(NOTES_MATCH_CANDIDATE_POOL)
         .all()
     )
-    logger.info("[NOTES] shopify candidates with note overlap: %s", len(rows))
+    candidate_ids = [pid for pid, _ in candidate_rows]
+    logger.info("[NOTES] candidate pool (>=1 shared note): %s", len(candidate_ids))
+    if not candidate_ids:
+        logger.info("[NOTES] match_shopify_by_sql_notes -> 0 results (no candidates)")
+        return []
 
-    ref_set = set(ref_note_names)
-    results = []
-    max_notes = len(ref_note_names) or 1
-    for unified_id, match_count in rows:
-        row = db.query(UnifiedProduct).filter(UnifiedProduct.id == unified_id).first()
-        if row:
-            score = match_count / max_notes
-            # Which specific notes overlapped — the heart of the match, logged
-            # so you can see exactly why a product was chosen.
-            shop_notes = {n for _, n in db.query(
-                PerfumeNote.note_type, PerfumeNote.note_name
-            ).filter(PerfumeNote.unified_product_id == unified_id).all()}
-            overlap = sorted(ref_set & shop_notes)
+    # ── Phase 2: full-note weighted scoring (Python) ───────────────────
+    cand_notes = _notes_by_type_bulk(db, candidate_ids)
+    scored: list[tuple[int, float, dict]] = []
+    for pid in candidate_ids:
+        score, breakdown = weighted_note_similarity(ref_by_type, cand_notes.get(pid, {}))
+        scored.append((pid, score, breakdown))
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    kept = [s for s in scored if s[1] >= min_similarity][:top_k]
+    dropped = len(scored) - len(kept)
+    logger.info(
+        "[NOTES] weighted scoring | %s candidates scored, %s below %.0f%% threshold dropped, %s kept",
+        len(scored), dropped, min_similarity * 100, len(kept),
+    )
+
+    if not kept:
+        # Nothing cleared the bar — show the best miss anyway, for debugging.
+        if scored:
+            pid, score, breakdown = scored[0]
             logger.info(
-                "[NOTES]   shopify #%s %r | matched %s/%s notes score=%.3f | overlap=%s",
-                unified_id, (row.title[:40] if row.title else ""),
-                match_count, max_notes, score, overlap,
+                "[NOTES] best candidate #%s still only %.0f%% similar (breakdown=%s) — below floor, no note match returned",
+                pid, score * 100, {k: f"{i}/{u}={c:.2f}" for k, (i, u, c) in breakdown.items()},
             )
-            results.append((row, float(score)))
+        return []
+
+    rows_by_id = {
+        r.id: r for r in db.query(UnifiedProduct).filter(UnifiedProduct.id.in_([pid for pid, _, _ in kept])).all()
+    }
+    results: list[tuple[UnifiedProduct, float]] = []
+    for pid, score, breakdown in kept:
+        row = rows_by_id.get(pid)
+        if not row:
+            continue
+        logger.info(
+            "[NOTES]   shopify #%s %r | similarity=%.0f%% breakdown=%s",
+            pid, (row.title or "")[:40], score * 100,
+            {k: f"{i}/{u}={c:.2f}" for k, (i, u, c) in breakdown.items()},
+        )
+        results.append((row, score))
     logger.info("[NOTES] match_shopify_by_sql_notes -> %s results", len(results))
     return results
 
@@ -218,12 +323,15 @@ def unified_to_widget_products(
             "gender": row.gender or "",
             "source_type": SOURCE_SHOPIFY,
         }
+        score = scores[i] if scores else 0.0
+        if scores:
+            meta["notes_similarity_pct"] = round(score * 100)
         if product.variants and isinstance(product.variants, list) and product.variants:
             v0 = product.variants[0]
             if isinstance(v0, dict):
                 meta["compare_at_price"] = float(v0.get("compare_at_price") or 0)
                 meta["variant_id"] = v0.get("id")
-        hit = format_product_hit(meta, store_base_url, score=scores[i] if scores else 0.0)
+        hit = format_product_hit(meta, store_base_url, score=score)
         products.append(hit)
     logger.info(
         "[NOTES] unified_to_widget_products | %s converted, %s skipped",

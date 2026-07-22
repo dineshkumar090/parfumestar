@@ -68,6 +68,10 @@ def format_product_hit(meta: dict, store_base_url: str, score: float = 0.0) -> d
         "variant_sizes": meta.get("variant_sizes", ""),
         "variant_prices": meta.get("variant_prices", ""),
         "has_variants": meta.get("has_variants", False),
+        # Only set for note-matched ("dupe") results — a weighted % of shared
+        # fragrance notes vs. the international reference, distinct from
+        # `score` (which may instead be a raw Pinecone cosine similarity).
+        "notes_similarity_pct": meta.get("notes_similarity_pct"),
     }
 
 

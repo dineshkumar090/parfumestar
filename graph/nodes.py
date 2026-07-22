@@ -236,12 +236,19 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
         # entirely missing. Always include a short snippet alongside notes.
         desc = (p.get("description") or "")[:220]
         desc_line = f"   Description: {desc}\n" if desc else ""
+        # Only set for note-matched "dupe" results (see note_matcher.py) — a
+        # real weighted % of shared notes vs. the international reference,
+        # not a generic confidence figure, so only surfaced when it exists.
+        similarity_line = ""
+        if p.get("notes_similarity_pct") is not None:
+            similarity_line = f"   Similarité des notes avec la référence: {p['notes_similarity_pct']}%\n"
         label = f"Parfum {chr(64 + i)}" if is_comparison else str(i)
         products_ctx += (
             f"\n{label}. {p.get('title', '')} — {p.get('price', 0)}€\n"
             f"   Notes: {note_info or 'non précisées'}\n"
             f"{desc_line}"
             f"{gender_line}"
+            f"{similarity_line}"
             f"   URL: {p.get('product_url', '')}\n"
         )
 
