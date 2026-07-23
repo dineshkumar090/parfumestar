@@ -440,25 +440,41 @@ def _embed_one(payload: dict, openai_api_key: str, openai_model: str) -> tuple[P
     return payload["product"], notes, embedding
 
 
+def structured_variants(product_variants: list | None) -> list[dict]:
+    """Normalize a Product.variants JSON list into [{variant_id, title,
+    price}, ...] — "variant_id" (not "id") to match what chatbot-widget.js's
+    add-to-cart already expects (product.variant_id / product.all_variant_ids)
+    and what rag/vector_store.py's format_product_hit reconstructs from the
+    parallel Pinecone metadata lists, so every card-building path (semantic
+    search, notes-matched, curated-link) produces the identical shape. Real
+    variant IDs are required for the widget's size dropdown + add-to-cart;
+    a comma-joined display string can't support either."""
+    out = []
+    for v in product_variants or []:
+        if not isinstance(v, dict) or v.get("id") is None:
+            continue
+        title = v.get("title") or "Standard"
+        try:
+            price = float(v.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        out.append({"variant_id": str(v["id"]), "title": title, "price": price})
+    return out
+
+
 def _build_shopify_pinecone_metadata(product: Product, shop: str, notes: "ExtractedNotes") -> dict:
     from app.services.document_service import clean_html
 
-    variant_prices, variant_sizes, compare_at_prices = [], [], []
-    if product.variants and len(product.variants) > 1:
-        for v in product.variants:
-            if isinstance(v, dict):
-                var_price = v.get("price", 0)
-                var_compare = v.get("compare_at_price")
-                var_title = v.get("title", "")
-                variant_prices.append(var_price)
-                if var_compare:
-                    compare_at_prices.append(float(var_compare))
-                if var_title and var_title != "Default Title":
-                    variant_sizes.append(var_title)
-    elif product.variants and len(product.variants) == 1:
-        v = product.variants[0]
+    variants = structured_variants(product.variants)
+    variant_prices = [v["price"] for v in variants]
+    variant_sizes = [v["title"] for v in variants if v["title"] != "Default Title"]
+    compare_at_prices = []
+    for v in (product.variants or []):
         if isinstance(v, dict) and v.get("compare_at_price"):
-            compare_at_prices.append(float(v["compare_at_price"]))
+            try:
+                compare_at_prices.append(float(v["compare_at_price"]))
+            except (TypeError, ValueError):
+                pass
 
     return {
         "id": str(product.id),
@@ -482,8 +498,16 @@ def _build_shopify_pinecone_metadata(product: Product, shop: str, notes: "Extrac
         "inventory_quantity": product.inventory_quantity or 0,
         "in_stock": (product.inventory_quantity or 0) > 0,
         "tags": product.tags or "",
-        "has_variants": len(product.variants) > 1 if product.variants else False,
-        "variant_count": len(product.variants) if product.variants else 1,
+        "has_variants": len(variants) > 1,
+        "variant_count": len(variants) or 1,
+        # Structured (Pinecone supports list-of-string metadata; numeric
+        # variant prices are stringified and parsed back on read) — lets
+        # format_product_hit rebuild real {variant_id, title, price} options
+        # instead of an unparseable "30ml, 50ml" display string.
+        "variant_ids": [v["variant_id"] for v in variants],
+        "variant_titles": [v["title"] for v in variants],
+        "variant_prices_list": [str(v["price"]) for v in variants],
+        # Kept for any existing display-string consumers.
         "variant_sizes": ", ".join(variant_sizes) if variant_sizes else "",
         "variant_prices": ", ".join(f"${vp}" for vp in variant_prices) if variant_prices else "",
         "price_range": (

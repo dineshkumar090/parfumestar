@@ -12,6 +12,7 @@ from app.rag.preprocess import preprocess_query
 from app.rag.prompts import OUT_OF_SCOPE_PROMPT, PERFUME_ASSISTANT_PROMPT
 from app.rag.vector_store import search_knowledge_base, search_shopify_products
 from app.graph.state import ChatGraphState
+from app.services.product_grouping import group_same_perfume_products
 from app.services.recommendation_pipeline import resolve_products_for_query
 
 logger = logging.getLogger("uvicorn.error")
@@ -178,6 +179,14 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
         intent=intent,
         intent_detail=intent_detail,
     )
+
+    # Collapse same-perfume/different-size listings (e.g. "Star n°002 - 30ML"
+    # and "Star n°002 - 50ML" as separate Shopify products rather than
+    # variant options on one) into a single card with a merged size list —
+    # see product_grouping.py. No-op for catalogs already using native
+    # Shopify variants.
+    if products:
+        products = group_same_perfume_products(products)
 
     # Policy / knowledge fallback — also covers product_knowledge_query, since
     # generic perfumery questions ("qu'est-ce que l'oud ?", ingredient/allergy

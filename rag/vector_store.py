@@ -32,6 +32,33 @@ def _plain_text_description(raw: str, max_len: int = 300) -> str:
     return text[:max_len]
 
 
+def _rebuild_structured_variants(meta: dict) -> list[dict[str, Any]]:
+    """Reassemble [{variant_id, title, price}, ...] from the parallel
+    metadata lists product_sync.py stores (Pinecone metadata only supports
+    scalars and lists-of-strings, not nested objects — variants are already
+    structured dicts if this meta came straight from note_matcher.py's
+    unified_to_widget_products instead of a raw Pinecone hit)."""
+    existing = meta.get("variants")
+    if isinstance(existing, list) and existing and isinstance(existing[0], dict):
+        return existing
+
+    ids = meta.get("variant_ids") or []
+    titles = meta.get("variant_titles") or []
+    prices = meta.get("variant_prices_list") or []
+    variants = []
+    for i, vid in enumerate(ids):
+        try:
+            price = float(prices[i]) if i < len(prices) and prices[i] not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            price = 0.0
+        variants.append({
+            "variant_id": str(vid),
+            "title": titles[i] if i < len(titles) else "Standard",
+            "price": price,
+        })
+    return variants
+
+
 def format_product_hit(meta: dict, store_base_url: str, score: float = 0.0) -> dict[str, Any]:
     handle = (meta.get("handle") or "").strip()
     price_val = meta.get("price", 0)
@@ -44,6 +71,9 @@ def format_product_hit(meta: dict, store_base_url: str, score: float = 0.0) -> d
         compare_val = float(compare_val)
     except (TypeError, ValueError):
         compare_val = 0.0
+
+    variants = _rebuild_structured_variants(meta)
+    variant_ids = [v["variant_id"] for v in variants if v.get("variant_id")]
 
     return {
         "id": str(meta.get("id", "")),
@@ -68,6 +98,12 @@ def format_product_hit(meta: dict, store_base_url: str, score: float = 0.0) -> d
         "variant_sizes": meta.get("variant_sizes", ""),
         "variant_prices": meta.get("variant_prices", ""),
         "has_variants": meta.get("has_variants", False),
+        # Structured size options for the widget's size dropdown — real
+        # variant_id per size so "Add to Cart" adds the SELECTED size, not
+        # always the first/default one.
+        "variants": variants,
+        "variant_id": variant_ids[0] if variant_ids else "",
+        "all_variant_ids": variant_ids,
         # Only set for note-matched ("dupe") results — a weighted % of shared
         # fragrance notes vs. the international reference, distinct from
         # `score` (which may instead be a raw Pinecone cosine similarity).

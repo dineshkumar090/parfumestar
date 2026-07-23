@@ -11,9 +11,9 @@
   // console.log("window.location.pathname", window.location.pathname)
   console.log('[DEBUG] window.location.pathname:', window.location.pathname);
 
-  // if (!window.location.pathname.includes("/pages/contact")) {
-  //    return;
-  // }
+  if (!window.location.pathname.includes("/pages/contact")) {
+     return;
+  }
 
   const API_URL = 'https://py.brstdev.com:5008';
   const STORE_URL = window.location.origin;
@@ -894,17 +894,14 @@ function renderResponse(answer, originalTimestamp = null) {
       var topRow = document.createElement('div');
       topRow.style.cssText = 'display:flex; justify-content:space-between; align-items:flex-start; gap:8px';
 
-      var isSale = p.compare_at_price && parseFloat(p.compare_at_price) > parseFloat(p.price);
-      var discountPct = isSale ? Math.round(((parseFloat(p.compare_at_price) - parseFloat(p.price)) / parseFloat(p.compare_at_price)) * 100) : 0;
-
+      // Price is intentionally not shown on recommendation cards. A
+      // "X% similar" badge takes its place when this card came from
+      // fragrance-notes matching (see notes_similarity_pct in the backend).
+      var hasSimilarity = p.notes_similarity_pct !== undefined && p.notes_similarity_pct !== null;
       topRow.innerHTML = '<div style="font-weight:700;font-size:13px;color:#1a2e1a;line-height:1.3">' + escHtml(p.title) + '</div>' +
-        '<div style="text-align:right;flex-shrink:0">' +
-        (isSale ?
-          '<div style="font-size:11px;color:#888;text-decoration:line-through">$' + escHtml(String(parseFloat(p.compare_at_price).toFixed(2))) + '</div>' +
-          '<div style="font-weight:800;color:#c0392b;font-size:14px">$' + escHtml(String(parseFloat(p.price).toFixed(2))) + '</div>' +
-          '<div style="background:#c0392b;color:#fff;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-top:2px;display:inline-block">' + discountPct + '% OFF</div>'
-          : '<div style="font-weight:800;color:' + cfg.windowColor + ';font-size:14px">$' + escHtml(p.price) + '</div>') +
-        '</div>';
+        (hasSimilarity ?
+          '<div style="flex-shrink:0;text-align:right"><div style="background:' + cfg.windowColor + '18;color:' + cfg.windowColor + ';font-size:11px;font-weight:800;padding:3px 7px;border-radius:6px;white-space:nowrap">' + escHtml(String(p.notes_similarity_pct)) + '% similaire</div></div>'
+          : '');
       body.appendChild(topRow);
 
       if (p.category) {
@@ -920,13 +917,46 @@ function renderResponse(answer, originalTimestamp = null) {
         body.appendChild(desc);
       }
 
+      // Size selector — only when there's an actual choice. Selecting a
+      // size updates which variant "Add to Cart" adds and where "View
+      // Product" links to, so both buttons always act on the size the
+      // customer picked, not just the first/default one.
+      var sizeVariants = Array.isArray(p.variants) ? p.variants.filter(function (v) { return v && v.variant_id; }) : [];
+      if (sizeVariants.length > 1) {
+        var sizeRow = document.createElement('div');
+        sizeRow.style.cssText = 'margin-top:9px';
+        var sizeLabel = document.createElement('label');
+        sizeLabel.style.cssText = 'font-size:10px;color:#888;font-weight:700;letter-spacing:.3px;display:block;margin-bottom:3px';
+        sizeLabel.textContent = 'TAILLE';
+        sizeRow.appendChild(sizeLabel);
+        var sizeSelect = document.createElement('select');
+        sizeSelect.style.cssText = 'width:100%;font-size:12px;padding:6px 8px;border-radius:8px;border:1.5px solid ' + cfg.windowColor + '44;background:#fff;color:#1a2e1a;font-weight:600;cursor:pointer';
+        sizeVariants.forEach(function (v, idx) {
+          var opt = document.createElement('option');
+          opt.value = String(idx);
+          opt.textContent = v.title || 'Standard';
+          sizeSelect.appendChild(opt);
+        });
+        sizeSelect.onchange = function () {
+          var chosen = sizeVariants[sizeSelect.selectedIndex];
+          p.variant_id = chosen.variant_id;
+          if (chosen.product_url && viewBtn) viewBtn.href = chosen.product_url;
+        };
+        sizeRow.appendChild(sizeSelect);
+        body.appendChild(sizeRow);
+        p.variant_id = sizeVariants[0].variant_id;
+      } else if (sizeVariants.length === 1) {
+        p.variant_id = sizeVariants[0].variant_id;
+      }
+
       // THREE BUTTONS ROW
       var btnRow = document.createElement('div');
       btnRow.style.cssText = 'display:flex; gap:7px; margin-top:11px';
 
       // View Product button
+      var viewBtn = null;
       if (p.product_url) {
-        var viewBtn = document.createElement('a');
+        viewBtn = document.createElement('a');
         viewBtn.className = 'cb-view-btn';
         viewBtn.href = p.product_url;
         viewBtn.target = '_blank';

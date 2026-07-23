@@ -327,10 +327,15 @@ def unified_to_widget_products(
         if scores:
             meta["notes_similarity_pct"] = round(score * 100)
         if product.variants and isinstance(product.variants, list) and product.variants:
+            from app.services.product_sync import structured_variants  # local: avoids a module-load-order cycle
+
+            meta["variants"] = structured_variants(product.variants)
             v0 = product.variants[0]
-            if isinstance(v0, dict):
-                meta["compare_at_price"] = float(v0.get("compare_at_price") or 0)
-                meta["variant_id"] = v0.get("id")
+            if isinstance(v0, dict) and v0.get("compare_at_price"):
+                try:
+                    meta["compare_at_price"] = float(v0["compare_at_price"])
+                except (TypeError, ValueError):
+                    pass
         hit = format_product_hit(meta, store_base_url, score=score)
         products.append(hit)
     logger.info(
