@@ -107,10 +107,16 @@ async def serve_widget():
         os.path.join(project_root, "AI-Assistant", "public", "chatbot-widget.js"),
         os.path.join(app_dir, "AI-Assistant", "public", "chatbot-widget.js"),
     ]
+    # No Cache-Control was set here before, so browsers/CDNs were free to cache
+    # this script indefinitely under their own default heuristics — every UI
+    # tweak to the widget then required affected users to hard-refresh (or
+    # wait out a CDN TTL) before they'd actually see it. Force revalidation on
+    # every load instead, so a deploy always takes effect immediately.
+    headers = {"Cache-Control": "no-cache, must-revalidate"}
     for widget_path in candidates:
         widget_path = os.path.abspath(widget_path)
         if os.path.exists(widget_path):
-            return FileResponse(widget_path, media_type="application/javascript")
+            return FileResponse(widget_path, media_type="application/javascript", headers=headers)
 
     return {"error": "Widget not found. Expected AI-Assistant/public/chatbot-widget.js"}
 

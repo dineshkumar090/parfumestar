@@ -57,6 +57,7 @@ interface ChatbotConfig {
   icon_shape: string[];
   desktop_position: string;
   transparent_bg: boolean;
+  card_layout: string;
   selected_pages: string[];
   quick_chips: QuickChip[];
   // Dynamic prompts
@@ -98,6 +99,7 @@ const DEFAULT_CONFIG: ChatbotConfig = {
   icon_shape: ['rounded'],
   desktop_position: 'bottomRight',
   transparent_bg: false,
+  card_layout: 'list',
   selected_pages: ['home', 'product', 'checkout'],
   button_text: 'Ask me anything!',
   cart_icon: 'mdi:cart',
@@ -955,6 +957,25 @@ export default function ChatbotControl() {
                         Add Button
                       </Button>
                     </BlockStack>
+                  </BlockStack>
+                </Card>
+
+                {/* PRODUCT CARD LAYOUT */}
+                <Card>
+                  <BlockStack gap="400">
+                    <Text as="h2" variant="headingLg">Product Recommendations</Text>
+                    <Select
+                      label="Card Layout"
+                      value={config.card_layout}
+                      onChange={v => set('card_layout', v)}
+                      options={[
+                        { label: 'Single column (default)', value: 'list' },
+                        { label: 'Two cards per row', value: 'grid_2' },
+                        { label: 'Carousel (horizontal scroll)', value: 'carousel' },
+                        { label: 'Single column — horizontal cards', value: 'horizontal' },
+                      ]}
+                      helpText="Choose how recommended products are displayed in the chat widget."
+                    />
                   </BlockStack>
                 </Card>
 

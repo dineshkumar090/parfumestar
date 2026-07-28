@@ -35,14 +35,22 @@ _NOTE_SYNONYMS: dict[str, str] = {
     "grapefruit": "pamplemousse", "pompelmo": "pamplemousse",
     "citrus": "agrumes", "agrumi": "agrumes",
     "tangerine": "mandarine", "yuzu": "yuzu",
-    "petitgrain": "petitgrain", "neroli": "neroli",
+    "petitgrain": "petitgrain",
     # ── Floral (EN, IT) ─────────────────────────────────────────────────
     "jasmine": "jasmin", "gelsomino": "jasmin",
     "rose": "rose", "rosa": "rose",
     "lily": "lys", "giglio": "lys", "lily of the valley": "muguet", "mughetto": "muguet",
     "violet": "violette", "viola": "violette",
     "iris": "iris",
+    # Neroli IS orange blossom essence (steam-distilled vs. the absolute) —
+    # perfumery note lists use them interchangeably ("Néroli (Orange
+    # Blossom)" is literally how the international source writes it), so
+    # both must resolve to one canonical token or a candidate using one term
+    # never matches a reference using the other.
+    "neroli": "fleur d oranger",
     "orange blossom": "fleur d oranger", "fiori d arancio": "fleur d oranger", "fiori d'arancio": "fleur d oranger",
+    "cactus flower": "fleur de cactus", "fleur de cactus": "fleur de cactus",
+    "white camellia": "camelia blanc", "camelia blanc": "camelia blanc", "camellia": "camelia blanc",
     "tuberose": "tubereuse", "tuberosa": "tubereuse",
     "ylang ylang": "ylang ylang",
     "peony": "pivoine", "peonia": "pivoine",

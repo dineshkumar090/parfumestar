@@ -32,6 +32,7 @@ CHATBOT_CONFIGS_COLUMNS: dict[str, str] = {
     "enable_variant_detection": "TINYINT(1) NULL DEFAULT 1",
     "enable_followup_detection": "TINYINT(1) NULL DEFAULT 1",
     "show_evaluation_button": "TINYINT(1) NULL DEFAULT 0",
+    "card_layout": "VARCHAR(30) NULL DEFAULT 'list'",
 }
 
 

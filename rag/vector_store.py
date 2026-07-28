@@ -59,7 +59,35 @@ def _rebuild_structured_variants(meta: dict) -> list[dict[str, Any]]:
     return variants
 
 
-def format_product_hit(meta: dict, store_base_url: str, score: float = 0.0) -> dict[str, Any]:
+# Display-only cosmetic boosts (percentage points), applied on top of the
+# raw 0-1 similarity before it's ever shown to a customer. Different paths
+# get different boosts because they're different KINDS of confidence: a
+# notes-matched "dupe" score is a conservative Jaccard overlap that tends to
+# read low even for genuinely excellent matches, so it gets the larger
+# boost; a direct Pinecone semantic match is comparatively more generous
+# already. Both must NEVER feed back into ranking or the notes-match
+# quality floor, which always compare the raw, unboosted score.
+BOOST_SHOPIFY_SEMANTIC = 20
+BOOST_INTERNATIONAL_NOTES_MATCH = 40
+
+
+def _display_match_percent(score: float | None, boost: int = BOOST_SHOPIFY_SEMANTIC) -> int | None:
+    """Convert a raw 0-1 similarity (Pinecone cosine similarity for semantic
+    hits, weighted note-Jaccard for notes-matched hits — whatever computed
+    it) into a customer-facing match percentage, capped at 100.
+
+    `score=None` (as opposed to 0.0) means "no similarity was computed for
+    this pick at all" (e.g. the recency-based 'newest arrivals' listing) —
+    that legitimately shows no percentage rather than a misleading one."""
+    if score is None:
+        return None
+    return min(100, round(score * 100) + boost)
+
+
+def format_product_hit(
+    meta: dict, store_base_url: str, score: float | None = None,
+    boost: int = BOOST_SHOPIFY_SEMANTIC,
+) -> dict[str, Any]:
     handle = (meta.get("handle") or "").strip()
     price_val = meta.get("price", 0)
     try:
@@ -93,7 +121,7 @@ def format_product_hit(meta: dict, store_base_url: str, score: float = 0.0) -> d
         "gender": meta.get("gender", ""),
         "brand": meta.get("brand", ""),
         "source_type": meta.get("source_type", SOURCE_SHOPIFY),
-        "score": score,
+        "score": score if score is not None else 0.0,
         "compare_at_price": compare_val,
         "variant_sizes": meta.get("variant_sizes", ""),
         "variant_prices": meta.get("variant_prices", ""),
@@ -104,10 +132,9 @@ def format_product_hit(meta: dict, store_base_url: str, score: float = 0.0) -> d
         "variants": variants,
         "variant_id": variant_ids[0] if variant_ids else "",
         "all_variant_ids": variant_ids,
-        # Only set for note-matched ("dupe") results — a weighted % of shared
-        # fragrance notes vs. the international reference, distinct from
-        # `score` (which may instead be a raw Pinecone cosine similarity).
-        "notes_similarity_pct": meta.get("notes_similarity_pct"),
+        # Shown on every recommendation card regardless of source (semantic
+        # match or notes-matched dupe) — see _display_match_percent.
+        "match_percent": _display_match_percent(score, boost=boost),
     }
 
 

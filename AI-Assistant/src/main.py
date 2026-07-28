@@ -350,8 +350,14 @@ async def serve_widget():
 
     print("Resolved widget path:", widget_path)
 
+    # Force revalidation on every load — without this, browsers/CDNs are free
+    # to cache the script under their own default heuristics, so a widget
+    # deploy can silently not take effect until a hard refresh or CDN TTL expiry.
     if os.path.exists(widget_path):
-        return FileResponse(widget_path, media_type="application/javascript")
+        return FileResponse(
+            widget_path, media_type="application/javascript",
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
 
     return {"error": f"Widget not found at {widget_path}"}
 async def serve_widget():

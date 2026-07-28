@@ -3206,6 +3206,7 @@ class ChatbotConfigRequest(BaseModel):
     icon_shape: List[str] = ["rounded"]
     desktop_position: str = "bottomRight"
     transparent_bg: bool = False
+    card_layout: str = "list"  # list | grid_2 | carousel | horizontal
     selected_pages: List[str] = ["home", "product", "checkout"]
     quick_chips: Optional[list] = None
     
@@ -3316,6 +3317,7 @@ def save_chatbot_config(config_data: ChatbotConfigRequest, db: Session = Depends
         config.icon_shape = config_data.icon_shape
         config.desktop_position = config_data.desktop_position
         config.transparent_bg = config_data.transparent_bg
+        config.card_layout = config_data.card_layout
         config.selected_pages = config_data.selected_pages
         config.button_text = config_data.button_text
 
@@ -3395,6 +3397,7 @@ def save_chatbot_config(config_data: ChatbotConfigRequest, db: Session = Depends
                 "icon_shape": config.icon_shape,
                 "desktop_position": config.desktop_position,
                 "transparent_bg": config.transparent_bg,
+                "card_layout": config.card_layout,
                 "selected_pages": config.selected_pages,
                 "quick_chips": config.quick_chips,
                 "system_prompts": config.system_prompts,

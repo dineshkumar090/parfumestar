@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import INTERNATIONAL_MATCH_THRESHOLD
@@ -18,6 +20,101 @@ from app.services.note_matcher import (
     shopify_products_from_curated_links,
     unified_to_widget_products,
 )
+
+# Raw (pre-display-boost) confidence assigned when the customer's query
+# literally names an existing product. This is deliberately high — nothing
+# in the semantic/notes-matching pipeline should be able to outrank a
+# product the customer typed the name of. min_query_len guards against a
+# short, generic fragment ("Star") coincidentally matching half the catalog.
+EXACT_TITLE_MATCH_SCORE = 0.9
+EXACT_TITLE_MATCH_MIN_QUERY_LEN = 5
+
+# Conversational wrapper the customer types around the actual product name —
+# "share me City Pulse parfume" needs to become "City Pulse" before any SQL
+# title match has a chance. Leading command phrases are stripped in a loop
+# (handles more than one back-to-back), trailing generic category words are
+# stripped once. This is deliberately just command/filler vocabulary, never
+# arbitrary substrings, so a real product name is never mutilated.
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:share(?:\s+with)?\s+me|montre[\s-]?moi|montrez[\s-]?moi|"
+    r"partage[\s-]?moi|partagez[\s-]?moi|envoie[\s-]?moi|envoyez[\s-]?moi|"
+    r"donne[\s-]?moi|donnez[\s-]?moi|je\s+veux|je\s+voudrais|j'?aimerais|"
+    r"montre|voir|afficher|show\s+me|i\s+want|find\s+me|find|search\s+for|"
+    r"c'?est\s+quoi|quel\s+est|what\s+is)\s+",
+    re.IGNORECASE,
+)
+_TRAILING_FILLER_RE = re.compile(
+    r"\s+(?:parfum|parfums|parfume|parfumes|perfume|perfumes|fragrance|fragrances)\.?$",
+    re.IGNORECASE,
+)
+
+
+def _extract_core_product_phrase(query: str) -> str:
+    """'share me City Pulse parfume' -> 'City Pulse'."""
+    q = (query or "").strip()
+    prev = None
+    while prev != q:
+        prev = q
+        q = _LEADING_FILLER_RE.sub("", q).strip()
+    q = _TRAILING_FILLER_RE.sub("", q).strip()
+    return q
+
+
+def find_exact_shopify_product_match(
+    db: Session, shop: str, query: str, store_base_url: str,
+) -> list[dict]:
+    """If the query names (or contains the name of) a real, currently-
+    sellable product — "Star n°004", "Star n°004 - City Pulse", or just
+    "City Pulse" — that product must always win over any semantic or
+    notes-matched alternative; no algorithmic similarity score should be
+    able to outrank the literal thing the customer asked for.
+
+    Tries, in order, exact title / prefix / suffix / substring — e.g. a bare
+    "City Pulse" query is a SUFFIX of "Star n°004 - City Pulse", not a
+    prefix, and previously fell through this check entirely, landing on an
+    unrelated semantic match instead. Promotional/zero-price listings (see
+    product_grouping.is_promotional_product) are excluded from candidacy so
+    a BOGO SKU sharing the same name can never win over the real product."""
+    from app.services.product_grouping import is_promotional_product
+
+    core = _extract_core_product_phrase(query)
+    if len(core) < EXACT_TITLE_MATCH_MIN_QUERY_LEN:
+        return []
+    escaped = core.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+
+    def _search(pattern: str):
+        return (
+            db.query(UnifiedProduct)
+            .filter(
+                UnifiedProduct.source_type == SOURCE_SHOPIFY,
+                UnifiedProduct.shop_url == shop,
+                UnifiedProduct.is_enabled == 1,
+                UnifiedProduct.title.ilike(pattern),
+            )
+            .order_by(func.length(UnifiedProduct.title))
+            .limit(5)
+            .all()
+        )
+
+    rows: list[UnifiedProduct] = []
+    for tier, pattern in (
+        ("exact", escaped),
+        ("prefix", f"{escaped}%"),
+        ("suffix", f"%{escaped}"),
+        ("contains", f"%{escaped}%"),
+    ):
+        candidates = [r for r in _search(pattern) if not is_promotional_product(r.title, r.price)]
+        if candidates:
+            logger.info(
+                "[RAG] Exact-match tier=%s | query=%r core=%r -> %r (unified_id=%s)",
+                tier, query, core, candidates[0].title, candidates[0].id,
+            )
+            rows = candidates
+            break
+
+    if not rows:
+        return []
+    return unified_to_widget_products(db, rows[:1], store_base_url, scores=[EXACT_TITLE_MATCH_SCORE])
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -148,6 +245,15 @@ def resolve_products_for_query(
         query, shop, intent, is_intl_ref, is_own, gender, min_price, max_price,
         compare_products, intent_detail.get("is_newest_query"),
     )
+
+    # Exact/prefix product-name match always wins, checked before anything
+    # else (including comparison/newest) — no semantic or notes-matching
+    # score should ever be able to outrank a product the customer literally
+    # named. See find_exact_shopify_product_match for why.
+    exact = find_exact_shopify_product_match(db, shop, query, store_base_url)
+    if exact:
+        logger.info("[RAG] -> exact_title_match | final products selected: %s", len(exact))
+        return exact, "", "exact_title_match"
 
     if len(compare_products) >= 2:
         widget = _compare_products(index, embeddings, store_base_url, shop, compare_products, gender)

@@ -12,7 +12,7 @@ from app.models.main_database import UnifiedProduct
 from app.models.perfume_notes import PerfumeNote
 from app.models.products import Product
 from app.rag.constants import SOURCE_INTERNATIONAL, SOURCE_SHOPIFY
-from app.rag.vector_store import format_product_hit
+from app.rag.vector_store import BOOST_INTERNATIONAL_NOTES_MATCH, format_product_hit
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -80,23 +80,48 @@ def _notes_by_type_bulk(db: Session, unified_product_ids: list[int]) -> dict[int
     return grouped
 
 
+# Category (top/heart/base) alignment between two INDEPENDENTLY extracted
+# note lists is inherently unreliable — the international source categorizes
+# notes according to its own data structure, while Shopify's extraction
+# categorizes based on how a merchant happened to write the description.
+# When the same real ingredient lands in "top" on one side and "heart" on
+# the other (or one side's extraction dumps everything into a single
+# bucket), a purely per-category Jaccard falsely reports products as
+# dissimilar even when their actual fragrance composition is near-identical.
+# So the FLAT overlap (does this candidate contain roughly the same set of
+# ingredients at all, regardless of which layer either side assigned them
+# to) is the primary, most robust signal; category alignment is kept only
+# as a secondary refinement to reward genuinely correct top/heart/base
+# structure when it IS reliably extracted on both sides.
+_FLAT_WEIGHT = 0.7
+_CATEGORY_WEIGHT = 0.3
+
+
 def weighted_note_similarity(
     ref_by_type: dict[str, set[str]], cand_by_type: dict[str, set[str]],
 ) -> tuple[float, dict[str, tuple[int, int, float]]]:
-    """Category-weighted Jaccard similarity between two products' notes.
+    """Similarity between two products' notes, blending two signals:
+
+    1. FLAT Jaccard over the union of ALL notes regardless of category —
+       robust to top/heart/base categorization noise between two
+       independently-extracted note lists (see module comment above).
+    2. Category-weighted Jaccard (top/heart/base/olfactive) — a secondary
+       refinement that rewards correct layer structure when present.
 
     Matches COMPLETE normalized notes only (set membership — never substring
     or character-level comparison), so "abricot" can never accidentally
-    match "abri". Each category (top/heart/base/olfactive) contributes
-    intersection/union scaled by its weight; categories absent from both
-    sides are excluded from the denominator so a product with no
-    olfactive-family data isn't unfairly penalized relative to one that has
-    it. Returns (overall 0-1 score, {category: (intersection, union, cat_score)})
-    for transparent logging/debugging of exactly why a score came out the
-    way it did."""
+    match "abri". Returns (overall 0-1 score, breakdown) where breakdown
+    includes both the flat and per-category intersection/union numbers, for
+    transparent logging of exactly why a score came out the way it did."""
+    ref_all = set().union(*ref_by_type.values()) if ref_by_type else set()
+    cand_all = set().union(*cand_by_type.values()) if cand_by_type else set()
+    inter_all = len(ref_all & cand_all)
+    union_all = len(ref_all | cand_all)
+    flat_score = (inter_all / union_all) if union_all else 0.0
+
     total_weight = 0.0
     weighted_sum = 0.0
-    breakdown: dict[str, tuple[int, int, float]] = {}
+    breakdown: dict[str, tuple[int, int, float]] = {"_flat": (inter_all, union_all, flat_score)}
     for note_type, weight in _NOTE_TYPE_WEIGHTS.items():
         ref_set = ref_by_type.get(note_type, set())
         cand_set = cand_by_type.get(note_type, set())
@@ -108,7 +133,18 @@ def weighted_note_similarity(
         breakdown[note_type] = (inter, union, cat_score)
         total_weight += weight
         weighted_sum += weight * cat_score
-    overall = (weighted_sum / total_weight) if total_weight else 0.0
+    category_score = (weighted_sum / total_weight) if total_weight else 0.0
+
+    if union_all == 0:
+        overall = 0.0
+    elif total_weight == 0:
+        # No usable category breakdown at all (e.g. everything landed in one
+        # untyped bucket) — fall back to the flat score entirely rather than
+        # diluting it with a meaningless 0 category component.
+        overall = flat_score
+    else:
+        overall = _FLAT_WEIGHT * flat_score + _CATEGORY_WEIGHT * category_score
+    breakdown["_overall"] = (0, 0, overall)
     return overall, breakdown
 
 
@@ -323,9 +359,11 @@ def unified_to_widget_products(
             "gender": row.gender or "",
             "source_type": SOURCE_SHOPIFY,
         }
-        score = scores[i] if scores else 0.0
-        if scores:
-            meta["notes_similarity_pct"] = round(score * 100)
+        # None (not 0.0) when the caller has no similarity concept at all
+        # (e.g. the recency-based "newest arrivals" listing) — format_product_hit
+        # tells those two cases apart so a "newest" pick never shows a
+        # misleading match percentage it never actually earned.
+        score = scores[i] if scores is not None else None
         if product.variants and isinstance(product.variants, list) and product.variants:
             from app.services.product_sync import structured_variants  # local: avoids a module-load-order cycle
 
@@ -336,7 +374,12 @@ def unified_to_widget_products(
                     meta["compare_at_price"] = float(v0["compare_at_price"])
                 except (TypeError, ValueError):
                     pass
-        hit = format_product_hit(meta, store_base_url, score=score)
+        # Every current caller of this function (curated international
+        # links, SQL note-matching, the exact-title shortcut) is either
+        # international-reference-driven or score=None (newest arrivals,
+        # unaffected by the boost) — so the larger international boost is
+        # correct here regardless of which one produced this particular row.
+        hit = format_product_hit(meta, store_base_url, score=score, boost=BOOST_INTERNATIONAL_NOTES_MATCH)
         products.append(hit)
     logger.info(
         "[NOTES] unified_to_widget_products | %s converted, %s skipped",

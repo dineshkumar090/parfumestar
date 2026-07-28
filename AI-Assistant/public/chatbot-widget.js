@@ -164,6 +164,7 @@
     iconShape: ['rounded'],
     desktopPosition: 'bottomRight',
     transparentBg: false,
+    cardLayout: 'list', // list | grid_2 | carousel | horizontal
     buttonText: t.buttonText,
     cartIcon: 'mdi:cart',
     cartEnabled: true,
@@ -192,6 +193,7 @@
         cfg.iconShape = remote.icon_shape || cfg.iconShape;
         cfg.desktopPosition = remote.desktop_position || cfg.desktopPosition;
         cfg.transparentBg = remote.transparent_bg !== undefined ? remote.transparent_bg : cfg.transparentBg;
+        cfg.cardLayout = remote.card_layout || cfg.cardLayout;
         cfg.buttonText = remote.button_text || cfg.buttonText;
         cfg.cartIcon = remote.cart_icon || cfg.cartIcon;
         cfg.cartEnabled = remote.cart_enabled !== undefined ? remote.cart_enabled : cfg.cartEnabled;
@@ -279,10 +281,12 @@
   font-size:14px;
 }
       .cb-chip:hover { background:#2d6a4f; color:#fff; border-color:#2d6a4f; }
-      .cb-card { background:#fff; border:1.5px solid #d0e8da; border-radius:12px; overflow:hidden; cursor:default; transition:all .2s; box-shadow:0 1px 4px rgba(0,0,0,.06); }
+      .cb-card { background:#fff; border:1.5px solid #d0e8da; border-radius:10px; overflow:hidden; cursor:default; transition:all .2s; box-shadow:0 1px 4px rgba(0,0,0,.06); }
       .cb-card:hover { border-color:#2d6a4f; transform:translateY(-2px); box-shadow:0 4px 14px rgba(0,0,0,.1); }
-      .cb-img { width:100%; height:115px; object-fit:cover; display:block; background:#f0f7f4; }
-      .cb-img-ph { width:100%; height:115px; display:flex; align-items:center; justify-content:center; background:#f0f7f4; font-size:36px; }
+      .cb-img { width:100%; height:150px; object-fit:cover; display:block; background:#f0f7f4; }
+      .cb-img-ph { width:100%; height:150px; display:flex; align-items:center; justify-content:center; background:#f0f7f4; font-size:28px; }
+      .cb-size-select { width:100%; font-size:11px; padding:5px 26px 5px 9px; border-radius:7px; border:1.5px solid #d0e8da; background-color:#fff; color:#1a2e1a; font-weight:600; cursor:pointer; appearance:none; -webkit-appearance:none; -moz-appearance:none; background-repeat:no-repeat; background-position:right 8px center; background-size:9px; background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'><path d='M0 0l5 6 5-6z' fill='%23888'/></svg>"); transition:border-color .15s; }
+      .cb-size-select:hover, .cb-size-select:focus { border-color:#2d6a4f; outline:none; }
       .cb-row { animation:cb-slide .2s ease; }
       @keyframes cb-slide { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:none} }
       @keyframes cb-pulse { 0%,60%,100%{opacity:.3} 30%{opacity:1} }
@@ -312,7 +316,7 @@
         #chatbot-header { padding:12px 14px !important; }
         #chatbot-messages { padding:10px 8px !important; }
         #chatbot-input { font-size:16px !important; }
-        .cb-card { border-radius:10px !important; }
+        .cb-card { border-radius:9px !important; }
       }
 
        .cart-bump {
@@ -866,6 +870,12 @@ function renderResponse(answer, originalTimestamp = null) {
 
   function renderProductCards(products) {
     if (!$m) return;
+    // Merchant-configurable in Chatbot Settings > Product Recommendations:
+    //   list       — one per row, vertical card (default)
+    //   grid_2     — two cards per row
+    //   carousel   — one row, horizontal scroll
+    //   horizontal — one per row, image left / content right
+    var layout = cfg.cardLayout || 'list';
     var section = document.createElement('div');
     section.className = 'cb-row';
     section.style.cssText = 'display:flex; flex-direction:column; gap:8px; width:100%';
@@ -874,46 +884,61 @@ function renderResponse(answer, originalTimestamp = null) {
     lbl.innerHTML = renderIconHtml(cfg.headerIcon || '🛍️', 14) + ' <span>RECOMMENDED PRODUCTS</span>';
     section.appendChild(lbl);
     var grid = document.createElement('div');
-    grid.style.cssText = 'display:flex; flex-direction:column; gap:8px';
+    if (layout === 'grid_2') {
+      grid.style.cssText = 'display:grid; grid-template-columns:1fr 1fr; gap:6px';
+    } else if (layout === 'carousel') {
+      grid.style.cssText = 'display:flex; flex-direction:row; gap:8px; overflow-x:auto; scroll-snap-type:x mandatory; padding-bottom:4px; -webkit-overflow-scrolling:touch;';
+    } else {
+      grid.style.cssText = 'display:flex; flex-direction:column; gap:6px';
+    }
+    var isHorizontal = layout === 'horizontal';
     products.slice(0, 5).forEach(function (p) {
       var card = document.createElement('div');
       card.className = 'cb-card';
+      if (layout === 'carousel') {
+        card.style.cssText = 'flex:0 0 80%; max-width:240px; scroll-snap-align:start;';
+      } else if (isHorizontal) {
+        card.style.cssText = 'display:flex; flex-direction:row; align-items:stretch;';
+      }
       var imgWrap = document.createElement('div');
+      if (isHorizontal) imgWrap.style.cssText = 'flex:0 0 78px; width:78px;';
       if (p.image_url) {
         var img = document.createElement('img');
         img.className = 'cb-img'; img.src = p.image_url; img.alt = p.title || ''; img.loading = 'lazy';
-        img.onerror = function () { this.style.display = 'none'; var ph = document.createElement('div'); ph.className = 'cb-img-ph'; ph.textContent = '🛍️'; this.parentNode.insertBefore(ph, this.nextSibling); };
+        if (isHorizontal) img.style.cssText = 'width:78px; height:100%; min-height:78px; object-fit:cover; display:block; background:#f0f7f4;';
+        img.onerror = function () { this.style.display = 'none'; var ph = document.createElement('div'); ph.className = 'cb-img-ph'; ph.textContent = '🛍️'; if (isHorizontal) ph.style.cssText = 'width:78px; height:100%; min-height:78px; display:flex; align-items:center; justify-content:center; background:#f0f7f4; font-size:24px;'; this.parentNode.insertBefore(ph, this.nextSibling); };
         imgWrap.appendChild(img);
       } else {
         var ph = document.createElement('div'); ph.className = 'cb-img-ph'; ph.textContent = '🛍️';
+        if (isHorizontal) ph.style.cssText = 'width:78px; height:100%; min-height:78px; display:flex; align-items:center; justify-content:center; background:#f0f7f4; font-size:24px;';
         imgWrap.appendChild(ph);
       }
       card.appendChild(imgWrap);
       var body = document.createElement('div');
-      body.style.cssText = 'padding:10px 13px 13px';
+      body.style.cssText = 'padding:7px 10px 9px' + (isHorizontal ? '; flex:1; min-width:0' : '');
       var topRow = document.createElement('div');
       topRow.style.cssText = 'display:flex; justify-content:space-between; align-items:flex-start; gap:8px';
 
-      // Price is intentionally not shown on recommendation cards. A
-      // "X% similar" badge takes its place when this card came from
-      // fragrance-notes matching (see notes_similarity_pct in the backend).
-      var hasSimilarity = p.notes_similarity_pct !== undefined && p.notes_similarity_pct !== null;
-      topRow.innerHTML = '<div style="font-weight:700;font-size:13px;color:#1a2e1a;line-height:1.3">' + escHtml(p.title) + '</div>' +
-        (hasSimilarity ?
-          '<div style="flex-shrink:0;text-align:right"><div style="background:' + cfg.windowColor + '18;color:' + cfg.windowColor + ';font-size:11px;font-weight:800;padding:3px 7px;border-radius:6px;white-space:nowrap">' + escHtml(String(p.notes_similarity_pct)) + '% similaire</div></div>'
+      // Price is intentionally not shown on recommendation cards. A match%
+      // badge takes its place, shown for every product regardless of source
+      // (semantic match or notes-matched dupe) — see match_percent in the backend.
+      var hasMatch = p.match_percent !== undefined && p.match_percent !== null;
+      topRow.innerHTML = '<div style="font-weight:700;font-size:12px;color:#1a2e1a;line-height:1.3">' + escHtml(p.title) + '</div>' +
+        (hasMatch ?
+          '<div style="flex-shrink:0;text-align:right"><div style="background:' + cfg.windowColor + '18;color:' + cfg.windowColor + ';font-size:10px;font-weight:800;padding:2px 6px;border-radius:6px;white-space:nowrap">' + escHtml(String(p.match_percent)) + '% match</div></div>'
           : '');
       body.appendChild(topRow);
 
       if (p.category) {
         var cat = document.createElement('div');
-        cat.style.cssText = 'font-size:11px;color:' + cfg.windowColor + ';margin-top:3px;opacity:0.8';
+        cat.style.cssText = 'font-size:10px;color:' + cfg.windowColor + ';margin-top:2px;opacity:0.8';
         cat.textContent = '📌 ' + p.category;
         body.appendChild(cat);
       }
       if (p.description) {
         var desc = document.createElement('div');
-        desc.style.cssText = 'font-size:12px;color:#555;margin-top:7px;line-height:1.45';
-        desc.textContent = p.description.length > 90 ? p.description.substring(0, 90) + '…' : p.description;
+        desc.style.cssText = 'font-size:11px;color:#555;margin-top:5px;line-height:1.4';
+        desc.textContent = p.description.length > 70 ? p.description.substring(0, 70) + '…' : p.description;
         body.appendChild(desc);
       }
 
@@ -924,13 +949,13 @@ function renderResponse(answer, originalTimestamp = null) {
       var sizeVariants = Array.isArray(p.variants) ? p.variants.filter(function (v) { return v && v.variant_id; }) : [];
       if (sizeVariants.length > 1) {
         var sizeRow = document.createElement('div');
-        sizeRow.style.cssText = 'margin-top:9px';
-        var sizeLabel = document.createElement('label');
-        sizeLabel.style.cssText = 'font-size:10px;color:#888;font-weight:700;letter-spacing:.3px;display:block;margin-bottom:3px';
+        sizeRow.style.cssText = 'display:flex; align-items:center; gap:6px; margin-top:7px';
+        var sizeLabel = document.createElement('span');
+        sizeLabel.style.cssText = 'font-size:10px;color:#888;font-weight:700;letter-spacing:.3px;flex-shrink:0';
         sizeLabel.textContent = 'TAILLE';
         sizeRow.appendChild(sizeLabel);
         var sizeSelect = document.createElement('select');
-        sizeSelect.style.cssText = 'width:100%;font-size:12px;padding:6px 8px;border-radius:8px;border:1.5px solid ' + cfg.windowColor + '44;background:#fff;color:#1a2e1a;font-weight:600;cursor:pointer';
+        sizeSelect.className = 'cb-size-select';
         sizeVariants.forEach(function (v, idx) {
           var opt = document.createElement('option');
           opt.value = String(idx);
@@ -951,7 +976,7 @@ function renderResponse(answer, originalTimestamp = null) {
 
       // THREE BUTTONS ROW
       var btnRow = document.createElement('div');
-      btnRow.style.cssText = 'display:flex; gap:7px; margin-top:11px';
+      btnRow.style.cssText = 'display:flex; gap:6px; margin-top:8px';
 
       // View Product button
       var viewBtn = null;
@@ -962,7 +987,7 @@ function renderResponse(answer, originalTimestamp = null) {
         viewBtn.target = '_blank';
         viewBtn.rel = 'noopener noreferrer';
         viewBtn.textContent = 'View Product';
-        viewBtn.style.cssText = 'flex:1; text-align:center; background:' + cfg.windowColor + '12; color:' + cfg.windowColor + '; border:1.5px solid ' + cfg.windowColor + '44; font-size:12px; padding:8px 10px; border-radius:8px; text-decoration:none; font-weight:700; transition:all .15s; display:block;';
+        viewBtn.style.cssText = 'flex:1; text-align:center; background:' + cfg.windowColor + '12; color:' + cfg.windowColor + '; border:1.5px solid ' + cfg.windowColor + '44; font-size:11px; padding:6px 8px; border-radius:7px; text-decoration:none; font-weight:700; transition:all .15s; display:block;';
         btnRow.appendChild(viewBtn);
       }
 
@@ -970,7 +995,7 @@ function renderResponse(answer, originalTimestamp = null) {
       if (cfg.cartEnabled) {
         var addToCartBtn = document.createElement('button');
         addToCartBtn.textContent = 'Add to Cart';
-        addToCartBtn.style.cssText = 'flex:1; background:' + cfg.windowColor + '; color:#fff; border:none; font-size:12px; padding:8px 10px; border-radius:8px; cursor:pointer; font-weight:700; transition:all .15s;';
+        addToCartBtn.style.cssText = 'flex:1; background:' + cfg.windowColor + '; color:#fff; border:none; font-size:11px; padding:6px 8px; border-radius:7px; cursor:pointer; font-weight:700; transition:all .15s;';
         addToCartBtn.onclick = function (e) {
           e.stopPropagation();
           addToCart(p, 1, addToCartBtn);
@@ -982,7 +1007,7 @@ function renderResponse(answer, originalTimestamp = null) {
       var askBtn = document.createElement('button');
       askBtn.className = 'cb-ask-btn';
       askBtn.textContent = 'Ask more ✦';
-      askBtn.style.cssText = 'flex:1; background:' + cfg.windowColor + '12; color:' + cfg.windowColor + '; border:1.5px solid ' + cfg.windowColor + '44; font-size:12px; padding:8px 10px; border-radius:8px; cursor:pointer; font-weight:700; transition:all .15s;';
+      askBtn.style.cssText = 'flex:1; background:' + cfg.windowColor + '12; color:' + cfg.windowColor + '; border:1.5px solid ' + cfg.windowColor + '44; font-size:11px; padding:6px 8px; border-radius:7px; cursor:pointer; font-weight:700; transition:all .15s;';
       askBtn.addEventListener('click', function () {
         if ($i) $i.value = 'Tell me more about ' + p.title;
         sendMessage();

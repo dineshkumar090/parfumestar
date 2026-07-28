@@ -57,6 +57,13 @@ class ChatbotConfig(Base):
     desktop_position = Column(String(50),  default="bottomRight")   # bottomRight | bottomLeft | centerRight
     transparent_bg   = Column(Boolean,     default=False)
 
+    # Recommended-product card layout in the widget:
+    #   list       — one per row, vertical card (image on top) — current/default look
+    #   grid_2     — two cards per row
+    #   carousel   — single row, horizontal scroll
+    #   horizontal — one per row, horizontal card (image left, content right)
+    card_layout = Column(String(30), default="list")
+
     # ── Page visibility ────────────────────────────────────────────────────
     selected_pages   = Column(JSON, default=lambda: ["home", "product", "checkout"])
 

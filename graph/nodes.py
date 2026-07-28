@@ -12,7 +12,11 @@ from app.rag.preprocess import preprocess_query
 from app.rag.prompts import OUT_OF_SCOPE_PROMPT, PERFUME_ASSISTANT_PROMPT
 from app.rag.vector_store import search_knowledge_base, search_shopify_products
 from app.graph.state import ChatGraphState
-from app.services.product_grouping import group_same_perfume_products
+from app.services.product_grouping import (
+    enrich_missing_variants,
+    filter_promotional_products,
+    group_same_perfume_products,
+)
 from app.services.recommendation_pipeline import resolve_products_for_query
 
 logger = logging.getLogger("uvicorn.error")
@@ -180,12 +184,17 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
         intent_detail=intent_detail,
     )
 
-    # Collapse same-perfume/different-size listings (e.g. "Star n°002 - 30ML"
-    # and "Star n°002 - 50ML" as separate Shopify products rather than
-    # variant options on one) into a single card with a merged size list —
-    # see product_grouping.py. No-op for catalogs already using native
-    # Shopify variants.
+    # Drop BOGO/free-gift/zero-price listings, backfill size options from the
+    # live DB for any product whose Pinecone metadata predates the
+    # structured-variant fields, THEN collapse same-perfume/different-size
+    # listings (e.g. "Star n°002 - ML" and "Star n°002 - 50ML" as separate
+    # Shopify products rather than variant options on one) into a single card
+    # with a merged size list — see product_grouping.py. All three are
+    # no-ops for a catalog with no promo SKUs / native Shopify variants /
+    # fresh Pinecone data.
     if products:
+        products = filter_promotional_products(products)
+        products = enrich_missing_variants(db, products)
         products = group_same_perfume_products(products)
 
     # Policy / knowledge fallback — also covers product_knowledge_query, since
@@ -245,19 +254,15 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
         # entirely missing. Always include a short snippet alongside notes.
         desc = (p.get("description") or "")[:220]
         desc_line = f"   Description: {desc}\n" if desc else ""
-        # Only set for note-matched "dupe" results (see note_matcher.py) — a
-        # real weighted % of shared notes vs. the international reference,
-        # not a generic confidence figure, so only surfaced when it exists.
-        similarity_line = ""
-        if p.get("notes_similarity_pct") is not None:
-            similarity_line = f"   Similarité des notes avec la référence: {p['notes_similarity_pct']}%\n"
+        # NOTE: match/similarity percentage is deliberately NOT included here.
+        # It's already shown on the product card in the widget, so repeating
+        # it in the generated text would be redundant — see prompts.py rule.
         label = f"Parfum {chr(64 + i)}" if is_comparison else str(i)
         products_ctx += (
             f"\n{label}. {p.get('title', '')} — {p.get('price', 0)}€\n"
             f"   Notes: {note_info or 'non précisées'}\n"
             f"{desc_line}"
             f"{gender_line}"
-            f"{similarity_line}"
             f"   URL: {p.get('product_url', '')}\n"
         )
 
