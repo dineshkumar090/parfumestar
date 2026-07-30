@@ -221,10 +221,20 @@ def resolve_products_for_query(
     store_base_url: str,
     intent: str,
     intent_detail: dict,
+    embed_query_text: str | None = None,
 ) -> tuple[list[dict], str, str]:
     """
     Returns (shopify_widget_products, international_context, pipeline_path).
     NEVER returns international products in the product list.
+
+    `embed_query_text`, when given, is used ONLY for the semantic embedding
+    — a history-enriched version of `query` for short refinement messages
+    ("for a woman", "evening") that would otherwise search in isolation and
+    drift away from the conversation's actual topic (see
+    graph/nodes.py._build_context_aware_search_query). `query` itself stays
+    the customer's raw, unmodified message everywhere else (exact-title
+    matching, logging, the international-reference context text) — blending
+    prior context into THAT would corrupt exact-match SQL lookups.
     """
     is_intl_ref = intent_detail.get("is_international_reference") or intent == "reference_search"
     # NOTE: product_knowledge_query is deliberately excluded here — forcing
@@ -267,10 +277,15 @@ def resolve_products_for_query(
         if newest:
             return newest, "", "newest"
 
-    # Embed the query once — every search below (Shopify, international,
-    # knowledge base) reuses this vector instead of paying for its own
-    # OpenAI embeddings call for the same text.
-    query_vector = embed_query(embeddings, query)
+    # Embed once — every search below (Shopify, international, knowledge
+    # base) reuses this vector instead of paying for its own OpenAI
+    # embeddings call for the same text. Uses the history-enriched text when
+    # given (see docstring) so semantic search doesn't drift away from the
+    # conversation's actual topic on a short refinement message.
+    semantic_text = embed_query_text or query
+    if semantic_text != query:
+        logger.info("[RAG] using context-enriched text for embedding | raw=%r enriched=%r", query, semantic_text)
+    query_vector = embed_query(embeddings, semantic_text)
 
     # ── Own-product lookups never need the international index at all — skip
     # it entirely rather than searching and discarding the result. ─────────

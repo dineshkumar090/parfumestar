@@ -147,6 +147,47 @@ def policy_node(state: ChatGraphState) -> ChatGraphState:
     return state
 
 
+# A "clarifying question" style message ("Is the perfume for a man or a
+# woman?", "Day or evening wedding?") reads short in intent even though it
+# can run 8-10 words once written as a full question — 12 comfortably
+# covers that phrasing without also swallowing genuinely detailed requests.
+_CURRENT_QUERY_MAX_WORDS = 12
+# The PRIOR message must clearly be the substantial, topic-setting request
+# (not just another short back-and-forth reply) to be worth blending in.
+_PRIOR_MESSAGE_MIN_WORDS = 6
+
+
+def _build_context_aware_search_query(state: ChatGraphState, intent: str, intent_detail: dict) -> str | None:
+    """Returns a history-enriched query for SEMANTIC SEARCH ONLY, or None if
+    no enrichment applies. A short message ("for a woman", "evening",
+    "indoor", or a clarifying question like "Is the perfume for a man or a
+    woman?") is very likely a refinement/answer continuing an earlier
+    product-search thread, not a stand-alone request — embedding it alone
+    can drift entirely away from what the customer is still discussing
+    (e.g. "wedding perfume" ... "is it for a man or a woman?" searched in
+    isolation matches whatever's semantically closest to gender-neutral
+    phrasing, losing the wedding context entirely and returning unrelated
+    products).
+
+    Never applied to a specific product-name lookup (own_product_query /
+    reference_search) — blending unrelated prior context into "Star n°016"
+    would corrupt an otherwise clean, self-contained lookup."""
+    query = state["query"]
+    if len(query.split()) > _CURRENT_QUERY_MAX_WORDS:
+        return None
+    if intent_detail.get("is_own_product") or intent == "own_product_query":
+        return None
+    if intent_detail.get("is_international_reference") or intent == "reference_search":
+        return None
+    for m in reversed(state.get("history") or []):
+        content = (m.get("content") or "").strip()
+        if m.get("role") != "user" or content == query:
+            continue
+        if len(content.split()) > _PRIOR_MESSAGE_MIN_WORDS:
+            return f"{content} {query}"
+    return None
+
+
 def product_search_node(state: ChatGraphState) -> ChatGraphState:
     """Unified product search: Shopify direct OR international → SQL notes → Shopify only."""
     logger.info("[GRAPH] node=product_search | query=%r", state.get("query"))
@@ -173,6 +214,13 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
         state["pipeline_path"] = "followup_no_search"
         return state
 
+    embed_query_text = _build_context_aware_search_query(state, intent, intent_detail)
+    if embed_query_text:
+        logger.info(
+            "[GRAPH] short/ambiguous query %r enriched with prior context for search: %r",
+            state["query"], embed_query_text,
+        )
+
     products, intl_ctx, path = resolve_products_for_query(
         db=db,
         query=state["query"],
@@ -182,6 +230,7 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
         store_base_url=state["store_base_url"],
         intent=intent,
         intent_detail=intent_detail,
+        embed_query_text=embed_query_text,
     )
 
     # Drop BOGO/free-gift/zero-price listings, backfill size options from the
@@ -233,12 +282,21 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
     so both produce identical prompts."""
     products = state.get("shopify_products") or []
     is_comparison = state.get("pipeline_path") == "comparison"
+    is_followup = bool(state.get("suppress_product_cards"))
+    pipeline_path = state.get("pipeline_path", "")
     intent_detail = state.get("intent_detail") or {}
-    # Only expose gender to the LLM when the customer actually asked about it.
-    # Otherwise the model parrots the retrieved "Genre" field onto generic
-    # queries — e.g. answering "best perfume" with "voici des parfums pour
-    # femme" — an assumption the user never made.
-    gender_requested = bool((intent_detail.get("gender_preference") or "").strip())
+    # Expose gender to the LLM when the customer explicitly wants a
+    # gender-filtered recommendation, OR when they're looking at ONE
+    # specifically-named product (own_product / exact_title_match /
+    # follow-up) — e.g. "Is Star n°016 for men and women?" needs the Genre
+    # field to answer at all. For a generic multi-product recommendation
+    # query, gender stays hidden so the model doesn't parrot it unprompted
+    # (e.g. answering "best perfume" with "voici des parfums pour femme").
+    gender_requested = (
+        bool((intent_detail.get("gender_preference") or "").strip())
+        or pipeline_path in ("own_product", "exact_title_match")
+        or is_followup
+    )
 
     products_ctx = ""
     for i, p in enumerate(products[:5], 1):
@@ -249,10 +307,13 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
         if gender_requested and p.get("gender"):
             gender_line = f"   Genre: {p['gender']}\n"
         # Notes alone don't cover attribute questions (allergies, sensitive
-        # skin, longevity, season/occasion, gift-worthiness) — those live in
-        # free-text description, which used to only appear when notes were
-        # entirely missing. Always include a short snippet alongside notes.
-        desc = (p.get("description") or "")[:220]
+        # skin, longevity, season/occasion, gift-worthiness, "what notes are
+        # in this?") — those live in free-text description. A follow-up
+        # question about ONE already-shown product can afford a much longer
+        # snippet (little else competes for prompt space) than a multi-
+        # product recommendation list, where brevity matters more.
+        desc_len = 600 if is_followup else 220
+        desc = (p.get("description") or "")[:desc_len]
         desc_line = f"   Description: {desc}\n" if desc else ""
         # NOTE: match/similarity percentage is deliberately NOT included here.
         # It's already shown on the product card in the widget, so repeating
@@ -270,8 +331,7 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
     for m in (state.get("history") or [])[-4:]:
         history_text += f"{m.get('role', 'user')}: {m.get('content', '')[:200]}\n"
 
-    # Path-specific response-style guidance.
-    pipeline_path = state.get("pipeline_path", "")
+    # Path-specific response-style guidance (pipeline_path computed above).
     if pipeline_path in ("intl_sql_match", "intl_pinecone_fallback"):
         response_mode_directive = (
             "Ces produits sont des correspondances de profil olfactif issues de notre collection "

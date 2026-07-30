@@ -20,9 +20,16 @@ def get_pinecone_index(api_key: str, index_name: str):
     return pc.Index(index_name)
 
 
-def _plain_text_description(raw: str, max_len: int = 300) -> str:
+def _plain_text_description(raw: str, max_len: int = 600) -> str:
     """Strip HTML tags (Shopify descriptions are rich-text) before truncating,
-    so cards never show raw markup or a snippet cut off mid-tag."""
+    so cards never show raw markup or a snippet cut off mid-tag.
+
+    600 (not the widget's much shorter card-display length) because this is
+    the value STORED on the product dict and later reused as LLM context for
+    follow-up questions ("what notes does this have?", "is it for men or
+    women?") — anything trimmed off here is permanently gone by the time
+    that follow-up arrives, even though the widget itself independently
+    re-truncates to ~70 characters for the visible card text."""
     if not raw:
         return ""
     from app.services.document_service import clean_html
