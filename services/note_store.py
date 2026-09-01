@@ -63,6 +63,12 @@ _NOTE_SYNONYMS: dict[str, str] = {
     "honeysuckle": "chevrefeuille", "caprifoglio": "chevrefeuille",
     # ── Woods / base (EN, IT) ───────────────────────────────────────────
     "sandalwood": "santal", "legno di sandalo": "santal", "sandalo": "santal",
+    # "Bois de santal" and "Santal" are the SAME note written two ways (as are
+    # "Bois de cèdre"/"Cèdre") — mapped explicitly rather than by a generic
+    # "bois de X" -> X rule, which would be wrong: "bois de rose" (rosewood),
+    # "bois de cachemire" and "bois de gaïac" are all genuinely distinct notes
+    # from "rose"/"cachemire"/"gaïac" and must NOT be collapsed.
+    "bois de santal": "santal", "bois de cedre": "cedre",
     "cedar": "cedre", "cedarwood": "cedre", "cedro": "cedre",
     "vetiver": "vetiver", "oud": "oud", "agarwood": "oud", "patchouli": "patchouli",
     "oakmoss": "mousse de chene", "musco di quercia": "mousse de chene",
@@ -115,9 +121,70 @@ _NOTE_SYNONYMS: dict[str, str] = {
     "fig leaf": "feuille de figuier", "green notes": "notes vertes",
     # ── Aquatic / misc (EN, IT) ─────────────────────────────────────────
     "sea salt": "sel marin", "marine": "marine", "aquatic": "aquatique",
+    "aquatic notes": "aquatique", "water notes": "aquatique", "watery": "aquatique",
     "ozone": "ozone", "rain": "pluie", "powder": "poudre", "powdery": "poudre",
     "milk": "lait", "latte": "lait", "coconut milk": "lait de coco",
 }
+
+# Preparation/form wrappers that describe HOW a note was extracted or
+# presented, never WHICH note it is: "Notes aquatiques" is the note
+# "aquatique", "Teinture de rose" is "rose", "Absolue de jasmin" is
+# "jasmin". Stripped as whole leading words only (never a partial cut), so
+# both sides of a match compare the underlying ingredient rather than one
+# side's phrasing habit. This is what made Shopify's "Notes aquatiques"
+# fail to match the international source's bare "Aquatique".
+_DESCRIPTOR_PREFIXES: tuple[str, ...] = tuple(sorted([
+    "notes de", "note de", "notes", "note",
+    "teinture de", "essence de", "extrait de", "absolue de", "absolu de",
+    "huile de", "huile essentielle de", "infusion de", "concrete de",
+    "accord de", "accord", "touche de", "pointe de", "nuance de",
+], key=len, reverse=True))
+
+_DESCRIPTOR_SUFFIXES: tuple[str, ...] = tuple(sorted([
+    "absolue", "absolu", "essence", "extrait", "infusion", "concrete",
+], key=len, reverse=True))
+
+# French words that legitimately END in "s" while being singular — the
+# plural-stripping below must leave these alone or it would invent tokens
+# ("encens" -> "encen") that match nothing.
+_SINGULAR_ENDING_IN_S: frozenset[str] = frozenset({
+    "encens", "cassis", "anis", "iris", "gris", "ananas", "tournesol",
+})
+
+
+def _strip_descriptor_prefix(text: str) -> str:
+    for prefix in _DESCRIPTOR_PREFIXES:
+        p = prefix + " "
+        if text.startswith(p) and len(text) > len(p):
+            return text[len(p):].strip()
+    return text
+
+
+def _strip_descriptor_suffix(text: str) -> str:
+    for suffix in _DESCRIPTOR_SUFFIXES:
+        s = " " + suffix
+        if text.endswith(s) and len(text) > len(s):
+            return text[: -len(s)].strip()
+    return text
+
+
+def _singularize(text: str) -> str:
+    """Collapse French plurals so "Notes aquatiques" and "Aquatique", or
+    "Fruits rouges" and "Fruit rouge", resolve to the same token. Applied
+    identically to BOTH sides of every comparison, so it can only ever make
+    the same real note agree with itself — it never merges two different
+    notes, since distinct ingredients don't differ by a trailing "s"."""
+    out = []
+    for word in text.split():
+        if (
+            len(word) > 4
+            and word.endswith("s")
+            and word not in _SINGULAR_ENDING_IN_S
+            and not word.endswith(("is", "us", "as", "os", "ss"))
+        ):
+            word = word[:-1]
+        out.append(word)
+    return " ".join(out)
 
 # Geographic/origin qualifiers commonly appended to a note in perfumery
 # ("Bergamote de Calabre", "Jasmin d'Égypte", "Limone Costa d'Amalfi") that
@@ -137,6 +204,12 @@ _ORIGIN_QUALIFIERS: tuple[str, ...] = tuple(sorted([
     "d espagne", "espagnol", "espagnole", "spain",
     "de turquie", "turkey", "du maroc", "morocco", "de perse", "persia",
     "costa d amalfi", "d amalfi", "amalfi", "d italie", "italy", "italie",
+    "d afrique", "africa", "africain", "africaine",
+    "de virginie", "virginia", "du japon", "japan", "de java", "de tahiti",
+    "de russie", "russia", "d australie", "australia", "de somalie",
+    "d arabie", "arabia", "de tunisie", "de colombie", "du guatemala",
+    "de bourbon", "d amerique", "america", "du sri lanka", "de birmanie",
+    "de mysore", "du venezuela", "de damas", "damascena",
 ], key=len, reverse=True))  # longest-first so "costa d amalfi" wins over "d amalfi"
 
 
@@ -158,14 +231,23 @@ def normalize_note_name(raw: str) -> str:
          which can never equal a clean "neroli" or "fleur d oranger".
       2. Unicode-normalize + strip accents + lowercase.
       3. Strip apostrophes/hyphens (word separators, not meaningful chars).
-      4. Strip a trailing geographic/origin qualifier ("de Sicile", "Costa
-         d'Amalfi", "d'Égypte"...) — same ingredient, different provenance.
-      5. Translate common English/Italian note names to their French
-         equivalent (_NOTE_SYNONYMS) — a no-op when the input is already
-         French, since those keys simply won't match.
+      4. Repeatedly, until nothing more changes:
+         a. strip a trailing geographic/origin qualifier ("de Sicile",
+            "Costa d'Amalfi", "d'Afrique"...) — same ingredient, different
+            provenance;
+         b. strip a preparation/form wrapper ("Notes ...", "Teinture de
+            ...", "Absolue de ...") — same ingredient, different phrasing;
+         c. translate English/Italian names to French (_NOTE_SYNONYMS), a
+            no-op when the input is already French.
+         Looping to a fixed point (rather than one pass) matters because
+         each step can expose work for the others: "green notes" becomes
+         "notes vertes" via (c), which only THEN reveals the strippable
+         "notes" prefix in (b).
+      5. Collapse French plurals, so "Notes aquatiques" ends up at the same
+         token as a bare "Aquatique".
 
     The result is an underscore-joined canonical token ("fleur_d_oranger",
-    "notes_vertes") — stable, unambiguous, and safe to compare with a plain
+    "aquatique") — stable, unambiguous, and safe to compare with a plain
     `==` (never substring/character-level matching, so "abricot" can never
     accidentally equal "abri")."""
     if not raw:
@@ -175,7 +257,16 @@ def normalize_note_name(raw: str) -> str:
     text = "".join(c for c in text if not unicodedata.combining(c))
     text = text.replace("'", " ").replace("-", " ")
     text = " ".join(text.split())
-    text = _strip_origin_qualifier(text)
+
+    prev = None
+    while prev != text and text:
+        prev = text
+        text = _strip_origin_qualifier(text)
+        text = _strip_descriptor_prefix(text)
+        text = _strip_descriptor_suffix(text)
+        text = _NOTE_SYNONYMS.get(text, text)
+
+    text = _singularize(text)
     text = _NOTE_SYNONYMS.get(text, text)
     return text.replace(" ", "_")
 

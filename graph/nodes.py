@@ -7,17 +7,26 @@ import logging
 from langchain_openai import ChatOpenAI
 
 from app.rag.constants import POLICY_INTENTS, ChatIntent
-from app.rag.intent_classifier import classify_intent, intent_to_response_type
+from app.rag.intent_classifier import WANTS_DIFFERENT_PRODUCT_RE, classify_intent, intent_to_response_type
 from app.rag.preprocess import preprocess_query
 from app.rag.prompts import OUT_OF_SCOPE_PROMPT, PERFUME_ASSISTANT_PROMPT
 from app.rag.vector_store import search_knowledge_base, search_shopify_products
 from app.graph.state import ChatGraphState
+from app.services.category_matcher import detect_requested_category, filter_by_requested_category
 from app.services.product_grouping import (
     enrich_missing_variants,
+    filter_by_gender,
     filter_promotional_products,
     group_same_perfume_products,
 )
 from app.services.recommendation_pipeline import resolve_products_for_query
+
+# Pipeline paths where the customer named ONE specific thing (a product, an
+# exact comparison pair, or an already-resolved category branch) — the
+# category post-filter below must never second-guess these, or a customer
+# who explicitly asked about a real candle/mist product by name could have
+# it stripped out just for not being an "ordinary perfume".
+_CATEGORY_FILTER_EXEMPT_PATHS = {"exact_title_match", "own_product", "comparison", "category_match"}
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -233,6 +242,22 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
         embed_query_text=embed_query_text,
     )
 
+    # "Recommend me ANOTHER one" must actually surface something the customer
+    # hasn't already seen — otherwise a fresh search that happens to re-rank
+    # the same previously-shown product(s) first makes the bot look like it
+    # only knows about one item in that category. Excluding is a pure
+    # narrowing of an already-fetched pool, so it can only ever remove
+    # duplicates, never introduce a wrong product.
+    if products and last_shown and WANTS_DIFFERENT_PRODUCT_RE.search(state["query"]):
+        shown_ids = {p.get("shopify_id") for p in last_shown if p.get("shopify_id")}
+        narrowed = [p for p in products if p.get("shopify_id") not in shown_ids]
+        if narrowed:
+            logger.info(
+                "[GRAPH] 'another/different' request — excluded %s already-shown product(s)",
+                len(products) - len(narrowed),
+            )
+            products = narrowed
+
     # Drop BOGO/free-gift/zero-price listings, backfill size options from the
     # live DB for any product whose Pinecone metadata predates the
     # structured-variant fields, THEN collapse same-perfume/different-size
@@ -243,8 +268,30 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
     # fresh Pinecone data.
     if products:
         products = filter_promotional_products(products)
+        products = filter_by_gender(products, intent_detail.get("gender_preference"))
+        if path not in _CATEGORY_FILTER_EXEMPT_PATHS:
+            # Applies to every generic/semantic/notes-matched/newest path —
+            # NOT to a specific named-product lookup, an explicit comparison,
+            # or the dedicated category branch (already correctly scoped by
+            # construction). Default expectation on this store is "ordinary
+            # perfume" — this is what stops a men's-tagged candle or reed
+            # diffuser from slipping into a "recommend a men's perfume"
+            # answer via loose semantic/gender-only matching, and (when the
+            # customer DID name a category, e.g. brand + "brume") narrows an
+            # international notes-match's Shopify dupes down to that category.
+            requested_category = detect_requested_category(state["query"])
+            products = filter_by_requested_category(products, requested_category)
         products = enrich_missing_variants(db, products)
         products = group_same_perfume_products(products)
+        # THE final display cap — deliberately applied here, LAST, after every
+        # filter/grouping step above has already run. resolve_products_for_query
+        # returns a wider candidate pool than 5 specifically so this cap has
+        # real filtered survivors to keep; capping any earlier (as the pipeline
+        # used to, right when the search results came back) discarded good
+        # candidates before promotional/gender filtering ever got to use them,
+        # which is why a generic "show me some perfumes" query could end up
+        # with far fewer than 5 real products even though plenty existed.
+        products = products[:5]
 
     # Policy / knowledge fallback — also covers product_knowledge_query, since
     # generic perfumery questions ("qu'est-ce que l'oud ?", ingredient/allergy
@@ -315,6 +362,15 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
         desc_len = 600 if is_followup else 220
         desc = (p.get("description") or "")[:desc_len]
         desc_line = f"   Description: {desc}\n" if desc else ""
+        # Ingrédients (composition) is a DIFFERENT field than fragrance notes
+        # and is only ever populated from a dedicated metafield — most
+        # products have none. This line is shown UNCONDITIONALLY (not just
+        # when the classifier detects an ingredient question) so the model
+        # always has an honest, explicit signal instead of ever needing to
+        # fall back on the Notes line above and describe it as if it were
+        # the ingredients — that fallback is exactly what caused notes to be
+        # presented as ingredients on a follow-up question.
+        ingredients_line = f"   Ingrédients: {p.get('ingredients') or 'non disponible'}\n"
         # NOTE: match/similarity percentage is deliberately NOT included here.
         # It's already shown on the product card in the widget, so repeating
         # it in the generated text would be redundant — see prompts.py rule.
@@ -323,6 +379,7 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
             f"\n{label}. {p.get('title', '')} — {p.get('price', 0)}€\n"
             f"   Notes: {note_info or 'non précisées'}\n"
             f"{desc_line}"
+            f"{ingredients_line}"
             f"{gender_line}"
             f"   URL: {p.get('product_url', '')}\n"
         )

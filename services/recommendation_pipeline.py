@@ -6,7 +6,7 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.config import INTERNATIONAL_MATCH_THRESHOLD
@@ -14,6 +14,7 @@ from app.models.main_database import UnifiedProduct
 from app.rag.constants import SOURCE_INTERNATIONAL, SOURCE_SHOPIFY
 from app.rag.embeddings import embed_query
 from app.rag.vector_store import search_international, search_shopify_products
+from app.services.category_matcher import NON_PERFUME_CATEGORIES, detect_requested_category
 from app.services.note_matcher import (
     find_unified_by_pinecone_id,
     match_shopify_by_sql_notes,
@@ -185,6 +186,55 @@ def _newest_shopify_products(
     return unified_to_widget_products(db, rows, store_base_url)
 
 
+def _category_shopify_products(
+    db: Session,
+    shop: str,
+    store_base_url: str,
+    category_key: str,
+    gender: str | None,
+    min_price: float | None,
+    max_price: float | None,
+    top_k: int = 10,
+) -> list[dict]:
+    """Direct SQL lookup for an explicitly-named non-perfume category
+    ('brume', 'bougie', ...) — bypasses semantic search entirely. Shopify's
+    product_type field is populated on under 7% of this catalog, and pure
+    embedding similarity doesn't reliably separate a body mist from a
+    perfume (both get described with similar fragrance-note language) —
+    which is exactly why a "brume" request kept surfacing ordinary perfumes.
+    Title text is the one field that's always populated and always names
+    what the product actually is, so it's matched directly here rather than
+    trusting semantic proximity to a category word."""
+    variants = NON_PERFUME_CATEGORIES.get(category_key, ())
+    if not variants:
+        return []
+    title_clauses = [UnifiedProduct.title.ilike(f"%{v}%") for v in variants]
+    type_clauses = [UnifiedProduct.product_type.ilike(f"%{v}%") for v in variants]
+    q = db.query(UnifiedProduct).filter(
+        UnifiedProduct.source_type == SOURCE_SHOPIFY,
+        UnifiedProduct.shop_url == shop,
+        UnifiedProduct.is_enabled == 1,
+        or_(*title_clauses, *type_clauses),
+    )
+    if min_price is not None:
+        q = q.filter(UnifiedProduct.price >= min_price)
+    if max_price is not None:
+        q = q.filter(UnifiedProduct.price <= max_price)
+    if gender and gender != "mixte":
+        q = q.filter(
+            (UnifiedProduct.gender == gender)
+            | (UnifiedProduct.gender == "mixte")
+            | (UnifiedProduct.gender.is_(None))
+            | (UnifiedProduct.gender == "")
+        )
+    rows = q.limit(top_k).all()
+    logger.info(
+        "[RAG] _category_shopify_products | category=%s -> %s rows (gender=%s price=[%s,%s])",
+        category_key, len(rows), gender, min_price, max_price,
+    )
+    return unified_to_widget_products(db, rows, store_base_url)
+
+
 def _compare_products(
     index, embeddings, store_base_url: str, shop: str,
     names: list[str], gender: str | None,
@@ -261,6 +311,18 @@ def resolve_products_for_query(
     # score should ever be able to outrank a product the customer literally
     # named. See find_exact_shopify_product_match for why.
     exact = find_exact_shopify_product_match(db, shop, query, store_base_url)
+    if not exact:
+        # The raw query is often wrapped in a full question ("Which notes are
+        # available in this parfum Star n°806") that the filler-stripping in
+        # find_exact_shopify_product_match doesn't cover for every phrasing.
+        # The intent classifier already extracts just the product/brand name
+        # for its own purposes — reuse that as a second, more targeted
+        # attempt before falling back to fuzzy semantic search.
+        product_name_hint = (intent_detail.get("product_name") or "").strip()
+        if product_name_hint and product_name_hint.lower() != query.strip().lower():
+            exact = find_exact_shopify_product_match(db, shop, product_name_hint, store_base_url)
+            if exact:
+                logger.info("[RAG] exact match found via classifier product_name hint=%r", product_name_hint)
     if exact:
         logger.info("[RAG] -> exact_title_match | final products selected: %s", len(exact))
         return exact, "", "exact_title_match"
@@ -272,10 +334,30 @@ def resolve_products_for_query(
             return widget, "", "comparison"
 
     if intent_detail.get("is_newest_query"):
-        newest = _newest_shopify_products(db, shop, store_base_url, gender, min_price, max_price, top_k=5)
+        newest = _newest_shopify_products(db, shop, store_base_url, gender, min_price, max_price, top_k=10)
         logger.info("[RAG] newest branch | -> %s products", len(newest))
         if newest:
             return newest, "", "newest"
+
+    # A non-perfume category ("brume", "bougie", "rouge à lèvres", ...) named
+    # explicitly and with no brand mentioned — resolve it with a direct SQL
+    # title match rather than semantic search (see _category_shopify_products
+    # for why: this catalog's product_type field is mostly empty, and a body
+    # mist's fragrance-note-heavy description embeds too close to an actual
+    # perfume's for semantic top-k to reliably tell them apart). Skipped when
+    # a brand was named (is_intl_ref) so "brume inspirée de Dior" still goes
+    # through the international/notes-matching pipeline below — the global
+    # category post-filter in product_search_node narrows THAT path's output
+    # to the right category afterward instead.
+    requested_category = detect_requested_category(query)
+    if requested_category and not is_intl_ref:
+        cat_products = _category_shopify_products(
+            db, shop, store_base_url, requested_category, gender, min_price, max_price, top_k=10,
+        )
+        logger.info("[RAG] category branch | category=%s -> %s products", requested_category, len(cat_products))
+        if cat_products:
+            return cat_products, "", "category_match"
+        logger.info("[RAG] category branch found nothing for %r — falling through to semantic search", requested_category)
 
     # Embed once — every search below (Shopify, international, knowledge
     # base) reuses this vector instead of paying for its own OpenAI
@@ -293,11 +375,17 @@ def resolve_products_for_query(
         logger.info("[RAG] own-product query — searching Shopify only, skipping international index")
         shop_hits = search_shopify_products(
             index, embeddings, query, store_base_url,
-            shop=shop, top_k=8, vector=query_vector, gender=gender,
+            shop=shop, top_k=15, vector=query_vector, gender=gender,
             min_price=min_price, max_price=max_price,
         )
         logger.info("[RAG] Notes matching SKIPPED (own-product query)")
-        top = shop_hits[:3]
+        # own_product_query means the customer named ONE specific product
+        # (exact-match above already handles literal name matches) — this
+        # semantic fallback only runs when that lookup missed (typo,
+        # unusual phrasing), so it should return its single best guess, not
+        # pad the result with 2 more semantically-similar-but-different
+        # products the customer never asked about.
+        top = shop_hits[:1]
         logger.info("[RAG] -> own_product | final products selected: %s", len(top))
         return top, "", "own_product"
 
@@ -305,8 +393,14 @@ def resolve_products_for_query(
     logger.info("[RAG] Semantic search started | query=%r", query)
     with ThreadPoolExecutor(max_workers=2) as pool:
         shop_future = pool.submit(
+            # top_k=15 (not the final display count of 5) — promotional-listing
+            # filtering, gender safety-net filtering, and same-perfume/size
+            # grouping all run AFTER this and can legitimately shrink the pool,
+            # so a wider candidate set here is what keeps a generic "show me
+            # some perfumes" browse query from surfacing fewer than 5 real,
+            # distinct products once that post-processing runs.
             search_shopify_products, index, embeddings, query, store_base_url,
-            shop=shop, top_k=8, vector=query_vector, gender=gender,
+            shop=shop, top_k=15, vector=query_vector, gender=gender,
             min_price=min_price, max_price=max_price,
         )
         intl_future = pool.submit(
@@ -354,15 +448,21 @@ def resolve_products_for_query(
         )
         if not intl_hits:
             logger.info("[RAG] ...but international pool is empty — falling back to Shopify semantic results")
-            final = shop_hits[:5] if shop_hits else []
-            logger.info("[RAG] -> shopify_semantic | final products selected: %s", len(final))
+            # Return more than the 5 ultimately displayed — nodes.py's
+            # post-processing (promotional filtering, gender safety-net,
+            # same-perfume grouping) runs AFTER this and can legitimately
+            # shrink the list; slicing to the display count here first would
+            # throw away candidates that filtering needs as replacements,
+            # silently under-filling the final answer (see product_search_node).
+            final = shop_hits[:12] if shop_hits else []
+            logger.info("[RAG] -> shopify_semantic | candidates returned: %s", len(final))
             return final, "", "shopify_semantic"
         international = intl_hits[0]
         intl_score = international.get("score") or 0
     elif top.get("source_type") == SOURCE_SHOPIFY:
         logger.info("[RAG] Notes matching SKIPPED — no brand named, and top semantic result is already a Shopify product")
-        final = shop_hits[:5]
-        logger.info("[RAG] -> shopify_direct | final products selected: %s", len(final))
+        final = shop_hits[:12]
+        logger.info("[RAG] -> shopify_direct | candidates returned: %s", len(final))
         return final, "", "shopify_direct"
     else:
         # Top result is International despite no explicit brand mention.
@@ -377,8 +477,8 @@ def resolve_products_for_query(
                 "ignoring international, falling back to Shopify semantic results",
                 round(intl_score, 3), INTERNATIONAL_MATCH_THRESHOLD,
             )
-            final = shop_hits[:5] if shop_hits else []
-            logger.info("[RAG] -> shopify_semantic | final products selected: %s", len(final))
+            final = shop_hits[:12] if shop_hits else []
+            logger.info("[RAG] -> shopify_semantic | candidates returned: %s", len(final))
             return final, "", "shopify_semantic"
         international = top
     logger.info(
@@ -412,7 +512,7 @@ def resolve_products_for_query(
         # catalog, for international products with no curated mapping (or
         # whose curated picks are no longer active/enabled).
         sql_matches = match_shopify_by_sql_notes(
-            db, intl_row.id, shop, top_k=5, gender=gender,
+            db, intl_row.id, shop, top_k=10, gender=gender,
             min_price=min_price, max_price=max_price,
         )
         logger.info(
@@ -435,13 +535,13 @@ def resolve_products_for_query(
     fallback_hits = search_shopify_products(
         index, embeddings,
         f"dupe inspiré par {international.get('title', '')}",
-        store_base_url, shop=shop, top_k=8, gender=gender,
+        store_base_url, shop=shop, top_k=15, gender=gender,
         min_price=min_price, max_price=max_price,
     )
     logger.info("[RAG] Notes match fallback (semantic, biased by intl title) | %s hits | %s", len(fallback_hits), _fmt_hits(fallback_hits))
     if fallback_hits:
-        logger.info("[RAG] -> intl_pinecone_fallback | final products selected: %s", min(5, len(fallback_hits)))
-        return fallback_hits[:5], intl_ctx, "intl_pinecone_fallback"
+        logger.info("[RAG] -> intl_pinecone_fallback | candidates returned: %s", min(12, len(fallback_hits)))
+        return fallback_hits[:12], intl_ctx, "intl_pinecone_fallback"
 
     logger.info("[RAG] -> intl_no_match | final products selected: 0")
     return [], intl_ctx, "intl_no_match"

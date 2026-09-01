@@ -192,6 +192,20 @@ def classify_intent(
         result.min_price, result.max_price = min_p, max_p
     if not result.is_newest_query and _heuristic_is_newest(q_lower):
         result.is_newest_query = True
+    if not result.gender_preference:
+        # The LLM classifier occasionally leaves gender blank even on an
+        # explicit "men's perfume" / "pour homme" style CURRENT message
+        # (seen in production on gender-switch follow-ups) — a blank gender
+        # skips the Pinecone gender filter entirely, letting mismatched
+        # products through. Checked on the current message only (not
+        # history) so an earlier turn's gender never leaks into this one.
+        result.gender_preference = _heuristic_gender(q_lower)
+    if result.skip_product_search and WANTS_DIFFERENT_PRODUCT_RE.search(query):
+        logger.info(
+            "[INTENT] override: skip_product_search forced False — query requests a new/different product: %r",
+            query,
+        )
+        result.skip_product_search = False
 
     logger.info(
         "[INTENT] classify_intent(query=%r) via %s -> intent=%s conf=%s intl_ref=%s own=%s gender=%r "
@@ -251,6 +265,21 @@ _NEWEST_WORDS = ("nouveaut", "nouveau parfum", "nouveaux parfum", "dernière sor
 
 def _heuristic_is_newest(q: str) -> bool:
     return any(w in q for w in _NEWEST_WORDS)
+
+
+# A request verb followed (within a short window) by "another/different" —
+# "recommend me another mist", "montre-moi une autre brume" — always means a
+# FRESH product search, never a follow-up question about what's already on
+# screen. Requiring the verb avoids false-triggering on unrelated uses of
+# "autre" (e.g. "the other one you showed" comparing already-shown products,
+# which legitimately IS a follow-up).
+WANTS_DIFFERENT_PRODUCT_RE = re.compile(
+    r"\b(?:recommand\w*|montre\w*|donne\w*|propose\w*|trouve\w*|cherch\w*|"
+    r"show|recommend|suggest|find|give)\b[^.?!]{0,25}\b"
+    r"(?:un\s+autre|une\s+autre|d'autres?|autres?|quelque\s+chose\s+d'autre|"
+    r"another|a\s+different|something\s+else|other\s+options?)\b",
+    re.IGNORECASE,
+)
 
 
 def intent_to_response_type(intent: str) -> str:

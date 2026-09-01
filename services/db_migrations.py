@@ -160,6 +160,60 @@ def migrate_utf8mb4(engine: Engine) -> list[str]:
     return converted
 
 
+def renormalize_perfume_notes(engine: Engine) -> int:
+    """Recompute every stored `perfume_notes.note_name` from its preserved
+    `note_raw` original, so an improvement to normalize_note_name applies to
+    already-synced products instead of only to newly-synced ones.
+
+    This exists because note_name is written ONCE, at sync time — a fix to
+    the normalizer (e.g. teaching it that Shopify's "Notes aquatiques" and
+    the international source's "Aquatique" are the same note, or that "Bois
+    de santal" is "Santal") would otherwise have no effect on the ~20k rows
+    already in the table, and every existing product would keep matching on
+    the old, broken tokens until a full re-sync happened. Because note_raw
+    keeps the original text verbatim, the corrected value can be re-derived
+    locally — no Shopify API calls, no OpenAI note re-extraction, no
+    re-embedding.
+
+    Non-destructive by construction: UPDATEs names only, never inserts or
+    deletes. Two notes on the same product can now collapse to one token
+    (that IS the fix), leaving a redundant duplicate row — harmless, since
+    note_matcher loads each product's notes into a set. Idempotent: a second
+    run finds nothing to change."""
+    if "perfume_notes" not in inspect(engine).get_table_names():
+        return 0
+
+    from app.services.note_store import normalize_note_name
+
+    changed: list[dict] = []
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("SELECT id, note_name, note_raw FROM perfume_notes")
+        ).fetchall()
+
+        for row_id, note_name, note_raw in rows:
+            if not note_raw:
+                continue  # nothing to re-derive from; leave untouched
+            new_name = normalize_note_name(note_raw)
+            if not new_name or len(new_name) < 2 or new_name == note_name:
+                continue
+            changed.append({"i": row_id, "n": new_name})
+
+        for start in range(0, len(changed), 500):
+            conn.execute(
+                text("UPDATE perfume_notes SET note_name = :n WHERE id = :i"),
+                changed[start:start + 500],
+            )
+
+    if changed:
+        sample = [(c["n"]) for c in changed[:8]]
+        logger.info(
+            "Re-normalized %s/%s perfume_notes rows to current normalization rules (e.g. %s)",
+            len(changed), len(rows), sample,
+        )
+    return len(changed)
+
+
 def run_startup_migrations(engine: Engine) -> None:
     """Run all pending schema migrations."""
     try:
@@ -179,3 +233,11 @@ def run_startup_migrations(engine: Engine) -> None:
     converted = migrate_utf8mb4(engine)
     if converted:
         logger.info("Migration complete — converted to utf8mb4: %s", ", ".join(converted))
+
+    # Data (not schema) backfill — same rule: a failure here must never stop
+    # the app from starting, since the stale note tokens it fixes only degrade
+    # match quality rather than breaking the chatbot outright.
+    try:
+        renormalize_perfume_notes(engine)
+    except Exception as e:
+        logger.error("perfume_notes re-normalization failed (matching may use stale tokens): %s", e)

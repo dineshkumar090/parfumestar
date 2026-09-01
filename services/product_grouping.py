@@ -65,6 +65,33 @@ def filter_promotional_products(products: list[dict]) -> list[dict]:
     return kept
 
 
+def filter_by_gender(products: list[dict], gender: str | None) -> list[dict]:
+    """Drop products whose OWN tagged gender directly contradicts what the
+    customer explicitly asked for — a final, cheap correctness net applied
+    once after retrieval, regardless of which path (semantic, notes-matched,
+    own-product, newest) produced the candidates. This exists because the
+    upstream Pinecone/SQL gender filters only run when `gender` was actually
+    detected and passed through; if that detection ever misses (e.g. a
+    gender switch mid-conversation), a product could otherwise slip through
+    untagged-for-that-gender and get described inconsistently with its own
+    data. Products with no gender tag, or tagged mixte/unisexe, are always
+    kept — this only removes an explicit, direct conflict, never guesses
+    from absence of data."""
+    gender = (gender or "").strip().lower()
+    if gender not in ("homme", "femme"):
+        return products
+    kept = [p for p in products if (p.get("gender") or "").strip().lower() in ("", gender, "mixte", "unisexe")]
+    dropped = len(products) - len(kept)
+    if dropped:
+        logger.info(
+            "[GROUPING] filtered %s product(s) contradicting requested gender=%s: %s",
+            dropped, gender, [p.get("title") for p in products if p not in kept],
+        )
+    # Never let this filter alone produce zero results — an imperfect match
+    # is better than showing nothing.
+    return kept if kept else products
+
+
 def split_size_from_title(title: str) -> tuple[str, str | None]:
     """('Star n°002 - 30ML', '30ml') <- strips + normalizes the trailing
     size token; ('Star n°002', None) if there's no recognizable size
