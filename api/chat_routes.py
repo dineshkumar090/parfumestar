@@ -198,8 +198,9 @@ def _store_login_url(store) -> str:
 
 def _store_contact_url(store) -> str:
     if hasattr(store, "store_url") and store.store_url:
-        return store.store_url.rstrip("/") + "/pages/contact"
-    return f"https://{store.shop_domain}/pages/contact"
+        # return store.store_url.rstrip("/") + "/pages/contact"
+        return "https://parfumsstar.com/pages/contact"
+    return f"https://parfumsstar.com/pages/contact"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1680,9 +1681,10 @@ async def send_chat_message(
         logger.exception("Error in _ai_response")
         try:
             store = get_store_config(db, req.shop)
-            contact_url = _store_contact_url(store) if store else "/pages/contact"
+            contact_url = "https://parfumsstar.com/pages/contact"
+            # contact_url = _store_contact_url(store) if store else "/pages/contact"
         except Exception:
-            contact_url = "/pages/contact"
+            contact_url = "https://parfumsstar.com/pages/contact"
         answer = {
             "type": "redirect",
             "message": "I'm having trouble answering that. Our team can help you directly!",

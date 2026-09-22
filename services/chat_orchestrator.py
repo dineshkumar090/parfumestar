@@ -53,9 +53,11 @@ def _store_base_url(store) -> str:
 
 def _store_contact_url(store) -> str:
     if hasattr(store, "store_url") and store.store_url:
-        return store.store_url.rstrip("/") + "/pages/contact"
+        # return store.store_url.rstrip("/") + "/pages/contact"
+        return "https://parfumsstar.com/pages/contact"
     domain = getattr(store, "shop_domain", "")
-    return f"https://{domain}/pages/contact"
+    # return f"https://{domain}/pages/contact"
+    return f"https://parfumsstar.com/pages/contact"
 
 
 def _get_clients(store):
@@ -79,11 +81,19 @@ def _get_clients(store):
     return embeddings, index, model_name
 
 
-def _load_history(db: Session, thread_id: int | None) -> tuple[list[dict], list[dict]]:
+def _load_history(db: Session, thread_id: int | None) -> tuple[list[dict], list[dict], set[str]]:
+    """Returns (history, last_shown_products, all_shown_shopify_ids).
+
+    `last_shown` is only the most recent batch — right for "is IT unisex?"
+    style follow-ups. `all_shown` accumulates every product shown so far in
+    the thread, which is what "show me more Armani perfumes" needs: without
+    it, a second page would just re-rank and repeat the first one, making it
+    look like those are the only products that exist."""
     history: list[dict] = []
     last_shown: list[dict] = []
+    all_shown: set[str] = set()
     if not thread_id:
-        return history, last_shown
+        return history, last_shown, all_shown
 
     recent = (
         db.query(ChatMessage)
@@ -102,7 +112,11 @@ def _load_history(db: Session, thread_id: int | None) -> tuple[list[dict], list[
             prods = m.response_data.get("products", [])
             if prods:
                 last_shown = prods
-    return history, last_shown
+                for p in prods:
+                    sid = str(p.get("shopify_id") or "").strip()
+                    if sid:
+                        all_shown.add(sid)
+    return history, last_shown, all_shown
 
 
 def _log_intent(
@@ -179,7 +193,7 @@ class ChatOrchestrator:
         store_name = getattr(store, "store_name", None) or shop
 
         embeddings, index, model_name = _get_clients(store)
-        history, last_shown = _load_history(db, thread_id)
+        history, last_shown, all_shown_ids = _load_history(db, thread_id)
 
         initial_state = {
             "query": query,
@@ -200,6 +214,7 @@ class ChatOrchestrator:
             "store_name": store_name,
             "history": history,
             "last_shown_products": last_shown,
+            "all_shown_shopify_ids": all_shown_ids,
             "_db": db,
         }
         return store, initial_state
@@ -311,6 +326,22 @@ class ChatOrchestrator:
                 (chain_inputs.get("knowledge_context") or "")[:500],
                 (chain_inputs.get("international_context") or "")[:500],
             )
+
+            # Emit the product cards BEFORE the answer text starts streaming.
+            # Retrieval is already finished at this point, so the customer sees
+            # the perfumes immediately and the explanation arrives underneath
+            # them, instead of waiting for the whole LLM response first.
+            # finalize_answer decides show_products (policy intents and
+            # follow-up answers must NOT re-render cards), so it is reused
+            # here rather than duplicating that rule — this event and the
+            # closing `final` event can never disagree about what to show.
+            early = finalize_answer(result, "")
+            if early.get("show_products") and early.get("products"):
+                yield {
+                    "products": early["products"],
+                    "show_products": True,
+                    "type": early.get("type"),
+                }
 
             llm = ChatOpenAI(
                 model=result.get("model_name", "gpt-4o-mini"),

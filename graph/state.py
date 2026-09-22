@@ -27,6 +27,9 @@ class ChatGraphState(TypedDict, total=False):
     # Conversation
     history: list[dict]
     last_shown_products: list[dict]
+    # Every shopify_id shown so far in this thread — lets "show me more"
+    # return the NEXT page instead of repeating the first one.
+    all_shown_shopify_ids: set[str]
 
     # Pipeline
     intent: str

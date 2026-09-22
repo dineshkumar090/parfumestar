@@ -25,6 +25,7 @@ class ChatIntent(str, Enum):
     RETURNS = "returns_information"
     REFUND_POLICY = "refund_policy"
     CANCELLATION = "cancellation"
+    HUMAN_AGENT = "human_agent"
     GREETING = "greeting"
     GENERAL = "general"
 
@@ -46,9 +47,16 @@ INTENT_LABELS: dict[str, str] = {
     ChatIntent.RETURNS.value: "Returns",
     ChatIntent.REFUND_POLICY.value: "Refund Policy",
     ChatIntent.CANCELLATION.value: "Cancellation",
+    ChatIntent.HUMAN_AGENT.value: "Human Agent Request",
     ChatIntent.GREETING.value: "Greeting",
     ChatIntent.GENERAL.value: "General Inquiry",
 }
+
+# Shown verbatim whenever a customer asks for a human, and appended to order
+# enquiries. Kept here (not inside a prompt) so the phone number and contact
+# URL can never be paraphrased, translated, or hallucinated by the LLM.
+SUPPORT_PHONE = "+33 6 18 90 27 34"
+SUPPORT_CONTACT_PATH = "/pages/contact"
 
 POLICY_INTENTS = {
     ChatIntent.STORE_DETAILS.value,

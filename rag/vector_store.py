@@ -67,15 +67,25 @@ def _rebuild_structured_variants(meta: dict) -> list[dict[str, Any]]:
 
 
 # Display-only cosmetic boosts (percentage points), applied on top of the
-# raw 0-1 similarity before it's ever shown to a customer. Different paths
-# get different boosts because they're different KINDS of confidence: a
-# notes-matched "dupe" score is a conservative Jaccard overlap that tends to
-# read low even for genuinely excellent matches, so it gets the larger
-# boost; a direct Pinecone semantic match is comparatively more generous
-# already. Both must NEVER feed back into ranking or the notes-match
-# quality floor, which always compare the raw, unboosted score.
+# raw 0-1 similarity before it's ever shown to a customer. They must NEVER
+# feed back into ranking or the notes-match quality floor, which always
+# compare the raw, unboosted score.
+#
+# The notes-match boost was 40 while similarity used Jaccard, which
+# systematically under-scored a good dupe for the sole reason that the
+# Shopify product listed MORE notes than the reference (see
+# note_matcher._coverage). Coverage scoring fixed that pessimism at the
+# source, so a large boost on top is now double-counting.
+#
+# 20 is calibrated against the live catalog, over 1,275 hand-curated
+# international->Shopify dupe pairs vs 2,500 random pairs:
+#   boost   curated shown 100%   random shown 100%
+#     20          24.3%                0.1%
+#     40          34.0%                1.9%
+# i.e. 40 would tell customers that roughly 1 in 50 essentially unrelated
+# products is a perfect match. 20 keeps "100%" meaning something.
 BOOST_SHOPIFY_SEMANTIC = 20
-BOOST_INTERNATIONAL_NOTES_MATCH = 40
+BOOST_INTERNATIONAL_NOTES_MATCH = 20
 
 
 def _display_match_percent(score: float | None, boost: int = BOOST_SHOPIFY_SEMANTIC) -> int | None:
@@ -241,10 +251,14 @@ def search_shopify_products(
     gender: str | None = None,
     min_price: float | None = None,
     max_price: float | None = None,
+    collection: str | None = None,
 ) -> list[dict[str, Any]]:
+    """`collection`, when given, restricts results to products belonging to
+    that Shopify collection (e.g. "PLUS VENDUS") — semantic ranking within a
+    merchant-curated set rather than across the whole catalog."""
     logger.info(
-        "[SEARCH] search_shopify_products(query=%r, shop=%s, top_k=%s, gender=%s, price=[%s,%s])",
-        query, shop, top_k, gender, min_price, max_price,
+        "[SEARCH] search_shopify_products(query=%r, shop=%s, top_k=%s, gender=%s, price=[%s,%s], collection=%s)",
+        query, shop, top_k, gender, min_price, max_price, collection,
     )
     # Filter by `shop` (which uniquely identifies this store's Shopify products
     # — international reference vectors carry no `shop` field) rather than by
@@ -260,19 +274,46 @@ def search_shopify_products(
     # no pre-resync "missing metadata" gap to fall back from — an empty result
     # here genuinely means nothing in the catalog matches that budget.
     base_clauses += _price_clauses(min_price, max_price)
-    base_filt = base_clauses[0] if len(base_clauses) == 1 else {"$and": base_clauses}
+    if collection:
+        # Pinecone metadata stores `collections` as a list of strings; $in
+        # matches when ANY element of that list matches.
+        base_clauses.append({"collections": {"$in": [collection]}})
+
+    # Exclude €0 BOGO/free-gift SKUs at the SOURCE. This store carries 246 of
+    # them and their embeddings dominate generic queries — "recommend product"
+    # came back with a top-15 that was ENTIRELY gift SKUs, so filtering them
+    # downstream left nothing at all and the assistant reported that no
+    # products were available. Removing them from candidacy means top_k is
+    # filled with real, purchasable products instead. Skipped when the
+    # customer set their own min_price, which already implies a floor.
+    free_clause = {"price": {"$gt": 0}} if min_price is None else None
+    if free_clause:
+        base_clauses.append(free_clause)
+
+    def _filt(clauses: list[dict]) -> dict:
+        return clauses[0] if len(clauses) == 1 else {"$and": clauses}
 
     gender_clause = _gender_clause(gender)
-    filt = {"$and": base_clauses + [gender_clause]} if gender_clause else base_filt
+    all_clauses = base_clauses + ([gender_clause] if gender_clause else [])
     hits = semantic_search(
         index, embeddings, query, store_base_url,
-        top_k=top_k, metadata_filter=filt, vector=vector,
+        top_k=top_k, metadata_filter=_filt(all_clauses), vector=vector,
     )
     if not hits and gender_clause:
         logger.info("[SEARCH] shopify: 0 hits with gender filter — retrying without gender")
         hits = semantic_search(
             index, embeddings, query, store_base_url,
-            top_k=top_k, metadata_filter=base_filt, vector=vector,
+            top_k=top_k, metadata_filter=_filt(base_clauses), vector=vector,
+        )
+    if not hits and free_clause:
+        # Vectors embedded before `price` was written carry no price field,
+        # and a Pinecone $gt filter excludes vectors missing the field — so
+        # never let this optimisation be the reason a query returns nothing.
+        logger.info("[SEARCH] shopify: 0 hits with price>0 filter — retrying without it")
+        retry = [c for c in all_clauses if c is not free_clause]
+        hits = semantic_search(
+            index, embeddings, query, store_base_url,
+            top_k=top_k, metadata_filter=_filt(retry), vector=vector,
         )
     return hits
 

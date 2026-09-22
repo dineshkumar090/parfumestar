@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+from app.rag.constants import SUPPORT_PHONE
+
 
 def handle_order_intent(
     query: str,
@@ -34,8 +36,10 @@ def handle_order_intent(
         return {
             "type": "auth_required",
             "message": (
-                "To track your order, please log in to your account first. "
-                "Once logged in, I can look up your order status."
+                "Pour suivre votre commande, connectez-vous d'abord à votre compte : "
+                f"{login_url}. Une fois connecté, ouvrez la rubrique « Mes commandes » "
+                "de votre espace client pour voir le statut et le suivi de votre commande. "
+                f"Besoin d'aide ? Écrivez-nous via {contact_url} ou appelez le {SUPPORT_PHONE}."
             ),
             "products": [],
             "show_products": False,
@@ -49,8 +53,9 @@ def handle_order_intent(
         return {
             "type": "order",
             "message": (
-                "I can help you track your order. "
-                "Please provide your order number (e.g. #1234)."
+                "Je peux vous aider à suivre votre commande. "
+                "Indiquez-moi votre numéro de commande (par exemple #1234), ou retrouvez-le "
+                "directement dans la rubrique « Mes commandes » de votre espace client."
             ),
             "products": [],
             "show_products": False,
@@ -64,8 +69,10 @@ def handle_order_intent(
         return {
             "type": "order",
             "message": (
-                f"I couldn't find order #{order_id}. "
-                "Please check the number and try again, or contact our support team."
+                f"Je n'ai pas trouvé la commande #{order_id}. "
+                "Vérifiez le numéro et réessayez, ou consultez la rubrique « Mes commandes » "
+                "de votre espace client. "
+                f"Notre équipe peut aussi vous aider via {contact_url} ou au {SUPPORT_PHONE}."
             ),
             "products": [],
             "show_products": False,
@@ -76,8 +83,9 @@ def handle_order_intent(
 
     status = order_data.get("fulfillment_status") or order_data.get("financial_status", "unknown")
     message = (
-        f"Order #{order_data.get('name', order_id)} — Status: {status}. "
-        f"Total: {order_data.get('total_price', 'N/A')} {order_data.get('currency', '')}."
+        f"Commande #{order_data.get('name', order_id)} — Statut : {status}. "
+        f"Total : {order_data.get('total_price', 'N/A')} {order_data.get('currency', '')}. "
+        "Vous retrouvez le détail et le suivi dans la rubrique « Mes commandes » de votre espace client."
     )
 
     products = []

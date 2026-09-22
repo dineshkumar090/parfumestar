@@ -6,6 +6,7 @@ from app.graph.nodes import (
     classify_node,
     generate_node,
     greeting_node,
+    human_agent_node,
     orders_node,
     out_of_scope_node,
     policy_node,
@@ -22,6 +23,7 @@ def build_chat_graph():
     graph.add_node("preprocess", preprocess_node)
     graph.add_node("classify", classify_node)
     graph.add_node("greeting", greeting_node)
+    graph.add_node("human_agent", human_agent_node)
     graph.add_node("out_of_scope", out_of_scope_node)
     graph.add_node("orders", orders_node)
     graph.add_node("policy", policy_node)
@@ -36,6 +38,7 @@ def build_chat_graph():
         route_after_classify,
         {
             "greeting": "greeting",
+            "human_agent": "human_agent",
             "out_of_scope": "out_of_scope",
             "orders": "orders",
             "policy": "policy",
@@ -43,7 +46,7 @@ def build_chat_graph():
         },
     )
 
-    for node in ("greeting", "out_of_scope", "orders"):
+    for node in ("greeting", "human_agent", "out_of_scope", "orders"):
         graph.add_edge(node, END)
 
     graph.add_edge("policy", "generate")
@@ -64,6 +67,7 @@ def build_pre_generate_graph():
     graph.add_node("preprocess", preprocess_node)
     graph.add_node("classify", classify_node)
     graph.add_node("greeting", greeting_node)
+    graph.add_node("human_agent", human_agent_node)
     graph.add_node("out_of_scope", out_of_scope_node)
     graph.add_node("orders", orders_node)
     graph.add_node("policy", policy_node)
@@ -77,6 +81,7 @@ def build_pre_generate_graph():
         route_after_classify,
         {
             "greeting": "greeting",
+            "human_agent": "human_agent",
             "out_of_scope": "out_of_scope",
             "orders": "orders",
             "policy": "policy",
@@ -84,7 +89,7 @@ def build_pre_generate_graph():
         },
     )
 
-    for node in ("greeting", "out_of_scope", "orders", "policy", "product_search"):
+    for node in ("greeting", "human_agent", "out_of_scope", "orders", "policy", "product_search"):
         graph.add_edge(node, END)
 
     return graph.compile()

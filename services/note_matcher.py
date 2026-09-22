@@ -86,56 +86,84 @@ def _notes_by_type_bulk(db: Session, unified_product_ids: list[int]) -> dict[int
 # categorizes based on how a merchant happened to write the description.
 # When the same real ingredient lands in "top" on one side and "heart" on
 # the other (or one side's extraction dumps everything into a single
-# bucket), a purely per-category Jaccard falsely reports products as
+# bucket), a purely per-category score falsely reports products as
 # dissimilar even when their actual fragrance composition is near-identical.
 # So the FLAT overlap (does this candidate contain roughly the same set of
 # ingredients at all, regardless of which layer either side assigned them
 # to) is the primary, most robust signal; category alignment is kept only
 # as a secondary refinement to reward genuinely correct top/heart/base
 # structure when it IS reliably extracted on both sides.
-_FLAT_WEIGHT = 0.7
-_CATEGORY_WEIGHT = 0.3
+_FLAT_WEIGHT = 0.75
+_CATEGORY_WEIGHT = 0.25
+
+# Below this many notes on the smaller side, a full-coverage result is not
+# yet trustworthy: a reference listing only 1-2 notes ("Musc", "Ambre")
+# would otherwise score 100% against any product that happens to contain
+# those two very common notes. Scores are damped toward 0.5x as the smaller
+# set shrinks below this, so a genuinely thin reference reads as "possible
+# match" rather than "perfect match". Sets of this size or larger are never
+# damped at all.
+_MIN_RELIABLE_NOTES = 3
+
+
+def _coverage(a: set[str], b: set[str]) -> tuple[int, int, float]:
+    """Overlap coefficient: |A ∩ B| / min(|A|, |B|).
+
+    Deliberately NOT Jaccard (|A ∩ B| / |A ∪ B|). A Shopify product usually
+    lists far more notes than the international reference it is a dupe of
+    — the real example that motivated this had 8 reference notes against 17
+    Shopify notes, ALL 8 matching. Jaccard scores that 8/17 = 47%, punishing
+    the Shopify product purely for describing itself in more detail, which
+    is not evidence of a worse match. Coverage scores it 8/8 = 100%: every
+    note the reference is known for is present in the candidate.
+
+    Returns (intersection, denominator, score) for transparent logging."""
+    if not a or not b:
+        return 0, 0, 0.0
+    inter = len(a & b)
+    denom = min(len(a), len(b))
+    return inter, denom, (inter / denom) if denom else 0.0
 
 
 def weighted_note_similarity(
     ref_by_type: dict[str, set[str]], cand_by_type: dict[str, set[str]],
 ) -> tuple[float, dict[str, tuple[int, int, float]]]:
-    """Similarity between two products' notes, blending two signals:
+    """Similarity between two products' notes, blending two coverage signals:
 
-    1. FLAT Jaccard over the union of ALL notes regardless of category —
-       robust to top/heart/base categorization noise between two
-       independently-extracted note lists (see module comment above).
-    2. Category-weighted Jaccard (top/heart/base/olfactive) — a secondary
-       refinement that rewards correct layer structure when present.
+    1. FLAT coverage over ALL notes regardless of category — robust to
+       top/heart/base categorization noise between two independently
+       extracted note lists (see module comment above).
+    2. Category-weighted coverage (top/heart/base/olfactive) — a secondary
+       refinement that rewards correct layer structure when present. Note
+       types missing on either side are SKIPPED rather than scored 0: a
+       category absent from one dataset is a data gap, not evidence that the
+       two perfumes differ.
 
-    Matches COMPLETE normalized notes only (set membership — never substring
-    or character-level comparison), so "abricot" can never accidentally
-    match "abri". Returns (overall 0-1 score, breakdown) where breakdown
-    includes both the flat and per-category intersection/union numbers, for
-    transparent logging of exactly why a score came out the way it did."""
+    Matches COMPLETE standardized notes only (set membership — never
+    substring or character-level comparison), so "abricot" can never
+    accidentally match "abri". Returns (overall 0-1 score, breakdown) where
+    breakdown carries the flat and per-category intersection/denominator
+    numbers, for transparent logging of exactly why a score came out as it
+    did."""
     ref_all = set().union(*ref_by_type.values()) if ref_by_type else set()
     cand_all = set().union(*cand_by_type.values()) if cand_by_type else set()
-    inter_all = len(ref_all & cand_all)
-    union_all = len(ref_all | cand_all)
-    flat_score = (inter_all / union_all) if union_all else 0.0
+    inter_all, denom_all, flat_score = _coverage(ref_all, cand_all)
 
     total_weight = 0.0
     weighted_sum = 0.0
-    breakdown: dict[str, tuple[int, int, float]] = {"_flat": (inter_all, union_all, flat_score)}
+    breakdown: dict[str, tuple[int, int, float]] = {"_flat": (inter_all, denom_all, flat_score)}
     for note_type, weight in _NOTE_TYPE_WEIGHTS.items():
         ref_set = ref_by_type.get(note_type, set())
         cand_set = cand_by_type.get(note_type, set())
-        if not ref_set and not cand_set:
+        if not ref_set or not cand_set:
             continue
-        inter = len(ref_set & cand_set)
-        union = len(ref_set | cand_set)
-        cat_score = (inter / union) if union else 0.0
-        breakdown[note_type] = (inter, union, cat_score)
+        inter, denom, cat_score = _coverage(ref_set, cand_set)
+        breakdown[note_type] = (inter, denom, cat_score)
         total_weight += weight
         weighted_sum += weight * cat_score
     category_score = (weighted_sum / total_weight) if total_weight else 0.0
 
-    if union_all == 0:
+    if denom_all == 0:
         overall = 0.0
     elif total_weight == 0:
         # No usable category breakdown at all (e.g. everything landed in one
@@ -144,7 +172,14 @@ def weighted_note_similarity(
         overall = flat_score
     else:
         overall = _FLAT_WEIGHT * flat_score + _CATEGORY_WEIGHT * category_score
-    breakdown["_overall"] = (0, 0, overall)
+
+    # Thin-reference damping (see _MIN_RELIABLE_NOTES).
+    if denom_all and denom_all < _MIN_RELIABLE_NOTES:
+        confidence = denom_all / _MIN_RELIABLE_NOTES
+        overall *= 0.5 + 0.5 * confidence
+        breakdown["_damped"] = (denom_all, _MIN_RELIABLE_NOTES, overall)
+
+    breakdown["_overall"] = (inter_all, denom_all, overall)
     return overall, breakdown
 
 

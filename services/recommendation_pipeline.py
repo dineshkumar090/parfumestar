@@ -14,6 +14,11 @@ from app.models.main_database import UnifiedProduct
 from app.rag.constants import SOURCE_INTERNATIONAL, SOURCE_SHOPIFY
 from app.rag.embeddings import embed_query
 from app.rag.vector_store import search_international, search_shopify_products
+from app.services.brand_matcher import (
+    detect_brand_listing_query,
+    get_known_brands,
+    shopify_products_for_brand,
+)
 from app.services.category_matcher import NON_PERFUME_CATEGORIES, detect_requested_category
 from app.services.note_matcher import (
     find_unified_by_pinecone_id,
@@ -120,6 +125,23 @@ def find_exact_shopify_product_match(
 logger = logging.getLogger("uvicorn.error")
 
 
+def _usable_shop_hits(hits: list[dict]) -> list[dict]:
+    """Drop BOGO/free-gift/zero-price listings from a raw Shopify hit list
+    IMMEDIATELY, before any slicing.
+
+    This store carries 246 active €0 gift SKUs ("🎁 Star n°276 - Robot
+    (100% off)"), and their embeddings win generic queries: "recommend
+    product" returned twelve hits that were ALL gift SKUs. The downstream
+    filter in product_search_node then removed every one, leaving nothing
+    and making the assistant announce that no products were available.
+    Filtering here instead means the candidate pool is real, purchasable
+    products to begin with, so a generic query still has something to
+    return. The downstream filter stays as an idempotent safety net."""
+    from app.services.product_grouping import filter_promotional_products
+
+    return filter_promotional_products(hits)
+
+
 def _fmt_hits(hits: list[dict], limit: int = 8) -> str:
     """Compact one-line summary of search hits for logging: id/title/score/source."""
     parts = []
@@ -184,6 +206,121 @@ def _newest_shopify_products(
     rows = q.order_by(UnifiedProduct.updated_at.desc()).limit(top_k).all()
     logger.info("[RAG] _newest_shopify_products | %s rows (gender=%s price=[%s,%s])", len(rows), gender, min_price, max_price)
     return unified_to_widget_products(db, rows, store_base_url)
+
+
+# Merchant-curated Shopify collections that carry a real editorial signal.
+# These are the store's OWN groupings, maintained in the Shopify admin —
+# far more trustworthy than inferring "best" or "newest" from semantic
+# similarity or from a sync timestamp. Verified present in this catalog:
+# "PLUS VENDUS" (103 products), "Nouveautés" (26).
+BESTSELLER_COLLECTION = "PLUS VENDUS"
+NEWEST_COLLECTION = "Nouveautés"
+
+
+def _collection_shopify_products(
+    db: Session,
+    shop: str,
+    store_base_url: str,
+    collection: str,
+    gender: str | None,
+    min_price: float | None,
+    max_price: float | None,
+    top_k: int = 10,
+) -> list[dict]:
+    """SQL fallback for collection membership, used when the Pinecone
+    collection filter returns nothing (older vectors were embedded before
+    `collections` was written to metadata, and a Pinecone $in filter silently
+    excludes vectors missing the field entirely).
+
+    `collections` is a JSON array of plain strings, so a LIKE over the JSON
+    text is a reliable membership test here; results are re-checked in Python
+    so a substring can never produce a false positive."""
+    import json as _json
+
+    q = db.query(UnifiedProduct).filter(
+        UnifiedProduct.source_type == SOURCE_SHOPIFY,
+        UnifiedProduct.shop_url == shop,
+        UnifiedProduct.is_enabled == 1,
+        UnifiedProduct.collections.isnot(None),
+        UnifiedProduct.collections.like(f"%{collection}%"),
+    )
+    if min_price is not None:
+        q = q.filter(UnifiedProduct.price >= min_price)
+    if max_price is not None:
+        q = q.filter(UnifiedProduct.price <= max_price)
+    if gender and gender != "mixte":
+        q = q.filter(
+            (UnifiedProduct.gender == gender)
+            | (UnifiedProduct.gender == "mixte")
+            | (UnifiedProduct.gender.is_(None))
+            | (UnifiedProduct.gender == "")
+        )
+
+    rows = []
+    for row in q.limit(top_k * 4).all():
+        colls = row.collections
+        if isinstance(colls, str):
+            try:
+                colls = _json.loads(colls)
+            except Exception:
+                colls = []
+        if isinstance(colls, list) and any(
+            collection.lower() == str(c).lower() for c in colls
+        ):
+            rows.append(row)
+        if len(rows) >= top_k:
+            break
+    logger.info(
+        "[RAG] _collection_shopify_products | collection=%r -> %s rows (gender=%s price=[%s,%s])",
+        collection, len(rows), gender, min_price, max_price,
+    )
+    return unified_to_widget_products(db, rows, store_base_url)
+
+
+def _bestseller_shopify_products(
+    db: Session,
+    shop: str,
+    store_base_url: str,
+    index,
+    embeddings,
+    query: str,
+    query_vector,
+    gender: str | None,
+    min_price: float | None,
+    max_price: float | None,
+    top_k: int = 10,
+) -> list[dict]:
+    """"Best" / "most popular" products, grounded in the merchant's own
+    PLUS VENDUS collection rather than invented.
+
+    This store has no Orders API access, so true sales figures are not
+    available — but the merchant already maintains a best-sellers collection
+    in Shopify, which is real editorial data and a far better answer than
+    ranking the whole catalog by description similarity to the word "best"
+    (which is close to meaningless as a semantic anchor, and is what
+    previously returned arbitrary, sometimes duplicated products).
+
+    Semantic search still does the RANKING, scoped to that collection, so
+    "best men's woody perfume" surfaces the most relevant bestsellers rather
+    than an arbitrary slice of them."""
+    hits = search_shopify_products(
+        index, embeddings, query, store_base_url,
+        shop=shop, top_k=top_k, vector=query_vector, gender=gender,
+        min_price=min_price, max_price=max_price,
+        collection=BESTSELLER_COLLECTION,
+    )
+    if hits:
+        logger.info("[RAG] bestsellers | %s semantically-ranked hits from %r", len(hits), BESTSELLER_COLLECTION)
+        return hits
+    logger.info(
+        "[RAG] bestsellers | Pinecone returned nothing for collection %r "
+        "(likely pre-`collections` vectors) — falling back to SQL membership",
+        BESTSELLER_COLLECTION,
+    )
+    return _collection_shopify_products(
+        db, shop, store_base_url, BESTSELLER_COLLECTION,
+        gender, min_price, max_price, top_k=top_k,
+    )
 
 
 def _category_shopify_products(
@@ -272,6 +409,7 @@ def resolve_products_for_query(
     intent: str,
     intent_detail: dict,
     embed_query_text: str | None = None,
+    exclude_shopify_ids: set[str] | None = None,
 ) -> tuple[list[dict], str, str]:
     """
     Returns (shopify_widget_products, international_context, pipeline_path).
@@ -334,7 +472,18 @@ def resolve_products_for_query(
             return widget, "", "comparison"
 
     if intent_detail.get("is_newest_query"):
-        newest = _newest_shopify_products(db, shop, store_base_url, gender, min_price, max_price, top_k=10)
+        # Prefer the merchant's own "Nouveautés" collection — real editorial
+        # data. The updated_at fallback below is a weak signal: it records
+        # when the SYNC last touched the row, so after a full re-sync every
+        # product shares roughly the same timestamp and "newest" degrades
+        # into an arbitrary ordering.
+        newest = _collection_shopify_products(
+            db, shop, store_base_url, NEWEST_COLLECTION,
+            gender, min_price, max_price, top_k=10,
+        )
+        if not newest:
+            logger.info("[RAG] newest | %r collection empty — falling back to updated_at ordering", NEWEST_COLLECTION)
+            newest = _newest_shopify_products(db, shop, store_base_url, gender, min_price, max_price, top_k=10)
         logger.info("[RAG] newest branch | -> %s products", len(newest))
         if newest:
             return newest, "", "newest"
@@ -359,6 +508,40 @@ def resolve_products_for_query(
             return cat_products, "", "category_match"
         logger.info("[RAG] category branch found nothing for %r — falling through to semantic search", requested_category)
 
+    # ── Brand LISTING ("Which Armani fragrances do you have?") ────────────
+    # Handled before the embedding, because it cannot be answered by
+    # semantic search at all: no Shopify product may name a designer brand
+    # (they are dupes), so the brand association exists only in the
+    # international catalog's curated links. Resolving this through the
+    # normal reference path returns the dupes of a SINGLE international
+    # perfume, which is why a brand listing kept returning ~3 products and
+    # claiming those were the only ones. See brand_matcher for the fan-out.
+    brand_listing = detect_brand_listing_query(query, get_known_brands(db))
+    if brand_listing:
+        brand_products, brand_total = shopify_products_for_brand(
+            db, brand_listing, shop, store_base_url,
+            gender=gender, min_price=min_price, max_price=max_price,
+            exclude_shopify_ids=exclude_shopify_ids, limit=12,
+        )
+        if brand_products:
+            # Surfaced to the LLM through {international_context} so it can
+            # state the real size of the range instead of implying the
+            # handful shown is everything we carry.
+            shown = min(5, len(brand_products))
+            brand_ctx = (
+                f"Le client demande la liste des parfums de la marque {brand_listing}. "
+                f"Notre boutique propose {brand_total} parfums dont le profil olfactif correspond "
+                f"à des parfums {brand_listing}. Tu en présentes {shown} ci-dessous. "
+                f"Précise bien qu'il en existe {brand_total} au total et que le client peut "
+                f"en demander d'autres — n'affirme JAMAIS que seuls ceux affichés sont disponibles."
+            )
+            logger.info(
+                "[RAG] -> brand_listing | brand=%r total=%s returned=%s",
+                brand_listing, brand_total, len(brand_products),
+            )
+            return brand_products, brand_ctx, "brand_listing"
+        logger.info("[RAG] brand listing for %r produced nothing — falling through", brand_listing)
+
     # Embed once — every search below (Shopify, international, knowledge
     # base) reuses this vector instead of paying for its own OpenAI
     # embeddings call for the same text. Uses the history-enriched text when
@@ -369,15 +552,31 @@ def resolve_products_for_query(
         logger.info("[RAG] using context-enriched text for embedding | raw=%r enriched=%r", query, semantic_text)
     query_vector = embed_query(embeddings, semantic_text)
 
+    # "Best" / "most popular" — answered from the merchant's own PLUS VENDUS
+    # collection, ranked semantically. Placed after the embedding (it reuses
+    # the vector) but before every generic search path, so a bestseller
+    # question is never answered by whole-catalog similarity to the word
+    # "best". Skipped for explicit brand queries, which must still resolve
+    # through the international/notes-matching pipeline below.
+    if intent_detail.get("is_bestseller_query") and not is_intl_ref and not is_own:
+        best = _bestseller_shopify_products(
+            db, shop, store_base_url, index, embeddings, query, query_vector,
+            gender, min_price, max_price, top_k=12,
+        )
+        logger.info("[RAG] bestseller branch | -> %s products", len(best))
+        if best:
+            return best, "", "bestseller"
+        logger.info("[RAG] bestseller branch found nothing — falling through to semantic search")
+
     # ── Own-product lookups never need the international index at all — skip
     # it entirely rather than searching and discarding the result. ─────────
     if is_own:
         logger.info("[RAG] own-product query — searching Shopify only, skipping international index")
-        shop_hits = search_shopify_products(
+        shop_hits = _usable_shop_hits(search_shopify_products(
             index, embeddings, query, store_base_url,
             shop=shop, top_k=15, vector=query_vector, gender=gender,
             min_price=min_price, max_price=max_price,
-        )
+        ))
         logger.info("[RAG] Notes matching SKIPPED (own-product query)")
         # own_product_query means the customer named ONE specific product
         # (exact-match above already handles literal name matches) — this
@@ -407,7 +606,7 @@ def resolve_products_for_query(
             search_international, index, embeddings, query, store_base_url,
             top_k=5, vector=query_vector, gender=gender,
         )
-        shop_hits = shop_future.result()
+        shop_hits = _usable_shop_hits(shop_future.result())
         intl_hits = intl_future.result()
     logger.info("[RAG] Semantic search completed")
     _log_semantic_search_results(query, shop_hits, intl_hits)
@@ -532,12 +731,12 @@ def resolve_products_for_query(
 
     # Fallback: no note-matched Shopify products — try a Pinecone shopify
     # search biased by the international title as a last resort.
-    fallback_hits = search_shopify_products(
+    fallback_hits = _usable_shop_hits(search_shopify_products(
         index, embeddings,
         f"dupe inspiré par {international.get('title', '')}",
         store_base_url, shop=shop, top_k=15, gender=gender,
         min_price=min_price, max_price=max_price,
-    )
+    ))
     logger.info("[RAG] Notes match fallback (semantic, biased by intl title) | %s hits | %s", len(fallback_hits), _fmt_hits(fallback_hits))
     if fallback_hits:
         logger.info("[RAG] -> intl_pinecone_fallback | candidates returned: %s", min(12, len(fallback_hits)))

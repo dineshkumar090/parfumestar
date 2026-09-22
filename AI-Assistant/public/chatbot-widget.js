@@ -253,6 +253,40 @@
     return d.innerHTML;
   }
 
+  // Turn plain text into safe HTML with clickable links. Escapes FIRST (so
+  // nothing in a message can inject markup), then wraps URLs, e-mails and
+  // phone numbers in anchors. Backend replies legitimately contain the store
+  // login URL, the contact page and the support phone number, all of which
+  // were previously rendered as dead plain text.
+  //
+  // ONE combined pass with alternation, so a span that has already been
+  // turned into an anchor is never re-scanned by a later pattern.
+  // ONE combined pass with alternation, so a span already turned into an
+  // anchor is never re-scanned by a later pattern. Written as a regex
+  // LITERAL, not new RegExp('...'): the string form needs every backslash
+  // doubled and silently degrades to a broken pattern if one is missed.
+  //          1 url                            2 email                              3 intl phone                       4 FR national
+  var _LINK_RE = /(https?:\/\/[^\s<>"']+[^\s<>"'.,;:!?)])|([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})|(\+\d{1,3}[\s.-]?(?:\d[\s.-]?){6,14}\d)|(\b0\d(?:[\s.-]?\d{2}){4}\b)/gi;
+
+  var _LINK_STYLE = 'color:inherit;text-decoration:underline;font-weight:600;';
+
+  function linkify(text) {
+    return escHtml(text).replace(_LINK_RE, function (m, url, email, telIntl, telFr) {
+      if (url) {
+        return '<a href="' + url + '" target="_blank" rel="noopener noreferrer" style="' +
+          _LINK_STYLE + 'word-break:break-all">' + url + '</a>';
+      }
+      if (email) {
+        return '<a href="mailto:' + email + '" style="' + _LINK_STYLE + '">' + email + '</a>';
+      }
+      var phone = telIntl || telFr;
+      var tel = phone.replace(/[^\d+]/g, '');
+      if (tel.replace(/\D/g, '').length < 8) return m;   // too short to be a phone
+      return '<a href="tel:' + tel + '" style="' + _LINK_STYLE + 'white-space:nowrap">' +
+        phone + '</a>';
+    });
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   //  INJECT CSS
   // ══════════════════════════════════════════════════════════════════════════
@@ -508,6 +542,7 @@ function injectDynamicStyles() {
     buildWidget();
   }
 
+  
   function updateChipArrows() {
     if (!$chipsContainer || !$arrowLeft || !$arrowRight) return;
     var el = $chipsContainer;
@@ -739,6 +774,9 @@ function injectDynamicStyles() {
       i++;
       setTimeout(typeNext, speed);
     } else {
+      // Typing is char-by-char plain text; swap in the linked version at the
+      // end so URLs/phones become clickable without breaking the animation.
+      element.innerHTML = linkify(text);
       if (onComplete) onComplete();
     }
   }
@@ -799,7 +837,9 @@ function injectDynamicStyles() {
     $m.appendChild(row);
 
     if (isUser || !isTypingEffect) {
-      textSpan.textContent = escHtml(text);
+      // innerHTML + linkify (which escapes internally). The old code passed
+      // escHtml(text) to textContent, double-escaping so "&" showed as "&amp;".
+      textSpan.innerHTML = linkify(text);
       scrollDn();
       return Promise.resolve(); 
     } else {
@@ -832,14 +872,24 @@ function startStreamingBotMessage() {
   scrollDn();
 
   var buffer = '';
-  return function appendDelta(piece) {
+  function appendDelta(piece) {
     buffer += piece;
-    textSpan.textContent = buffer;
+    textSpan.textContent = buffer;   // plain text while streaming: fast + safe
     scrollDn();
+  }
+  // Called once the stream ends, so the finished message gets clickable
+  // links. Doing it per-chunk would corrupt anchors split across chunks.
+  appendDelta.finalize = function () {
+    if (buffer) textSpan.innerHTML = linkify(buffer);
   };
+  return appendDelta;
 }
 
-function renderAnswerExtras(answer) {
+// `opts.skipProducts` is set when the cards were already rendered from the
+// early `products` stream event, so the closing `final` event does not draw
+// a second identical set.
+function renderAnswerExtras(answer, opts) {
+  opts = opts || {};
   var products = answer.products;
   var show_products = answer.show_products;
   var type = answer.type;
@@ -849,7 +899,7 @@ function renderAnswerExtras(answer) {
   var contact_url = answer.contact_url || '/pages/contact';
 
   if (type === 'auth_required') return;
-  if (show_products && products && products.length) renderProductCards(products);
+  if (!opts.skipProducts && show_products && products && products.length) renderProductCards(products);
   if (type === 'order' && order_data) renderOrderCard(order_data);
   if (show_contact || type === 'redirect') renderContactButton(contact_url, escalation_note);
 }
@@ -858,13 +908,25 @@ function renderResponse(answer, originalTimestamp = null) {
   var message = answer.message;
   var typingDone = Promise.resolve();
 
+  // Product cards come FIRST: a customer searching for a perfume wants to
+  // see the perfumes immediately, with the explanation underneath, rather
+  // than reading a paragraph before anything appears.
+  var drewProducts = false;
+  if (answer.type !== 'auth_required' && answer.show_products &&
+      answer.products && answer.products.length) {
+    renderProductCards(answer.products);
+    drewProducts = true;
+  }
+
   if (message) {
     // addText now returns a promise
     typingDone = addText(message || '', 'bot', !originalTimestamp, originalTimestamp);
   }
 
-  // ← Wait for typing to finish BEFORE showing cards
-  typingDone.then(function () { renderAnswerExtras(answer); });
+  // Remaining extras (order card, contact button) still belong after the text.
+  typingDone.then(function () {
+    renderAnswerExtras(answer, { skipProducts: drewProducts });
+  });
 }
 
 
@@ -901,7 +963,8 @@ function renderResponse(answer, originalTimestamp = null) {
         card.style.cssText = 'display:flex; flex-direction:row; align-items:stretch;';
       }
       var imgWrap = document.createElement('div');
-      if (isHorizontal) imgWrap.style.cssText = 'flex:0 0 78px; width:78px;';
+      imgWrap.style.position = 'relative';
+      if (isHorizontal) imgWrap.style.cssText = 'position:relative; flex:0 0 78px; width:78px;';
       if (p.image_url) {
         var img = document.createElement('img');
         img.className = 'cb-img'; img.src = p.image_url; img.alt = p.title || ''; img.loading = 'lazy';
@@ -913,21 +976,35 @@ function renderResponse(answer, originalTimestamp = null) {
         if (isHorizontal) ph.style.cssText = 'width:78px; height:100%; min-height:78px; display:flex; align-items:center; justify-content:center; background:#f0f7f4; font-size:24px;';
         imgWrap.appendChild(ph);
       }
+      // Match badge lives ON the image as an overlay pill. It used to sit in
+      // the title row, where a long product name plus a narrow carousel card
+      // could shrink it out of sight — which is why it stopped being visible.
+      // Absolute positioning makes it independent of the title length.
+      var hasMatch = p.match_percent !== undefined && p.match_percent !== null;
+      // if (hasMatch) {
+      //   var badge = document.createElement('div');
+      //   badge.textContent = String(p.match_percent) + '% match';
+      //   badge.style.cssText =
+      //     'position:absolute; top:6px; left:6px; z-index:2;' +
+      //     'background:' + cfg.windowColor + '; color:#fff;' +
+      //     'font-size:10px; font-weight:800; letter-spacing:.2px;' +
+      //     'padding:3px 7px; border-radius:999px; white-space:nowrap;' +
+      //     'box-shadow:0 1px 4px rgba(0,0,0,.25);';
+      //   imgWrap.appendChild(badge);
+      // }
       card.appendChild(imgWrap);
       var body = document.createElement('div');
-      body.style.cssText = 'padding:7px 10px 9px' + (isHorizontal ? '; flex:1; min-width:0' : '');
-      var topRow = document.createElement('div');
-      topRow.style.cssText = 'display:flex; justify-content:space-between; align-items:flex-start; gap:8px';
-
-      // Price is intentionally not shown on recommendation cards. A match%
-      // badge takes its place, shown for every product regardless of source
-      // (semantic match or notes-matched dupe) — see match_percent in the backend.
-      var hasMatch = p.match_percent !== undefined && p.match_percent !== null;
-      topRow.innerHTML = '<div style="font-weight:700;font-size:12px;color:#1a2e1a;line-height:1.3">' + escHtml(p.title) + '</div>' +
-        (hasMatch ?
-          '<div style="flex-shrink:0;text-align:right"><div style="background:' + cfg.windowColor + '18;color:' + cfg.windowColor + ';font-size:10px;font-weight:800;padding:2px 6px;border-radius:6px;white-space:nowrap">' + escHtml(String(p.match_percent)) + '% match</div></div>'
-          : '');
-      body.appendChild(topRow);
+      body.style.cssText = 'padding:9px 11px 11px' + (isHorizontal ? '; flex:1; min-width:0' : '');
+      // Price is intentionally not shown on recommendation cards; the match%
+      // badge (rendered over the image above) takes its place.
+      var titleEl = document.createElement('div');
+      titleEl.textContent = p.title || '';
+      titleEl.title = p.title || '';
+      titleEl.style.cssText =
+        'font-weight:700; font-size:12.5px; color:#14261a; line-height:1.35;' +
+        'display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;' +
+        'overflow:hidden; word-break:break-word;';
+      body.appendChild(titleEl);
 
       if (p.category) {
         var cat = document.createElement('div');
@@ -937,8 +1014,13 @@ function renderResponse(answer, originalTimestamp = null) {
       }
       if (p.description) {
         var desc = document.createElement('div');
-        desc.style.cssText = 'font-size:11px;color:#555;margin-top:5px;line-height:1.4';
-        desc.textContent = p.description.length > 70 ? p.description.substring(0, 70) + '…' : p.description;
+        // Clamped by CSS, not by cutting the string at a fixed length: the
+        // browser fits as much as the card width allows and ellipsises
+        // cleanly, instead of always stopping dead at 70 characters.
+        desc.style.cssText =
+          'font-size:11px; color:#5c6b60; margin-top:4px; line-height:1.45;' +
+          'display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;';
+        desc.textContent = p.description;
         body.appendChild(desc);
       }
 
@@ -949,7 +1031,7 @@ function renderResponse(answer, originalTimestamp = null) {
       var sizeVariants = Array.isArray(p.variants) ? p.variants.filter(function (v) { return v && v.variant_id; }) : [];
       if (sizeVariants.length > 1) {
         var sizeRow = document.createElement('div');
-        sizeRow.style.cssText = 'display:flex; align-items:center; gap:6px; margin-top:7px';
+        sizeRow.style.cssText = 'display:flex; align-items:center; gap:6px; margin-top:8px';
         var sizeLabel = document.createElement('span');
         sizeLabel.style.cssText = 'font-size:10px;color:#888;font-weight:700;letter-spacing:.3px;flex-shrink:0';
         sizeLabel.textContent = 'TAILLE';
@@ -976,7 +1058,7 @@ function renderResponse(answer, originalTimestamp = null) {
 
       // THREE BUTTONS ROW
       var btnRow = document.createElement('div');
-      btnRow.style.cssText = 'display:flex; gap:6px; margin-top:8px';
+      btnRow.style.cssText = 'display:flex; gap:5px; margin-top:10px; align-items:stretch';
 
       // View Product button
       var viewBtn = null;
@@ -987,7 +1069,7 @@ function renderResponse(answer, originalTimestamp = null) {
         viewBtn.target = '_blank';
         viewBtn.rel = 'noopener noreferrer';
         viewBtn.textContent = 'View Product';
-        viewBtn.style.cssText = 'flex:1; text-align:center; background:' + cfg.windowColor + '12; color:' + cfg.windowColor + '; border:1.5px solid ' + cfg.windowColor + '44; font-size:11px; padding:6px 8px; border-radius:7px; text-decoration:none; font-weight:700; transition:all .15s; display:block;';
+        viewBtn.style.cssText = 'flex:1; text-align:center; background:#fff; color:' + cfg.windowColor + '; border:1.5px solid ' + cfg.windowColor + '33; font-size:11px; padding:7px 6px; border-radius:8px; text-decoration:none; font-weight:700; transition:all .15s; display:flex; align-items:center; justify-content:center; line-height:1.2; cursor:pointer;';
         btnRow.appendChild(viewBtn);
       }
 
@@ -995,7 +1077,7 @@ function renderResponse(answer, originalTimestamp = null) {
       if (cfg.cartEnabled) {
         var addToCartBtn = document.createElement('button');
         addToCartBtn.textContent = 'Add to Cart';
-        addToCartBtn.style.cssText = 'flex:1; background:' + cfg.windowColor + '; color:#fff; border:none; font-size:11px; padding:6px 8px; border-radius:7px; cursor:pointer; font-weight:700; transition:all .15s;';
+        addToCartBtn.style.cssText = 'flex:1.2; background:' + cfg.windowColor + '; color:#fff; border:none; font-size:11px; padding:7px 6px; border-radius:8px; cursor:pointer; font-weight:800; transition:all .15s; box-shadow:0 1px 3px rgba(0,0,0,.16); line-height:1.2;';
         addToCartBtn.onclick = function (e) {
           e.stopPropagation();
           addToCart(p, 1, addToCartBtn);
@@ -1007,7 +1089,7 @@ function renderResponse(answer, originalTimestamp = null) {
       var askBtn = document.createElement('button');
       askBtn.className = 'cb-ask-btn';
       askBtn.textContent = 'Ask more ✦';
-      askBtn.style.cssText = 'flex:1; background:' + cfg.windowColor + '12; color:' + cfg.windowColor + '; border:1.5px solid ' + cfg.windowColor + '44; font-size:11px; padding:6px 8px; border-radius:7px; cursor:pointer; font-weight:700; transition:all .15s;';
+      askBtn.style.cssText = 'flex:1; text-align:center; background:#fff; color:' + cfg.windowColor + '; border:1.5px solid ' + cfg.windowColor + '33; font-size:11px; padding:7px 6px; border-radius:8px; text-decoration:none; font-weight:700; transition:all .15s; display:flex; align-items:center; justify-content:center; line-height:1.2; cursor:pointer;';
       askBtn.addEventListener('click', function () {
         if ($i) $i.value = 'Tell me more about ' + p.title;
         sendMessage();
@@ -1325,8 +1407,11 @@ function renderResponse(answer, originalTimestamp = null) {
     btn.innerHTML = '💬 Contact Us';
     wrap.appendChild(btn);
 
-    // Show 48-hour note if present
-    if (escalationNote) {
+    // Show the note if present. Internal snake_case markers (e.g.
+    // "human_agent_requested") are backend state, not customer-facing copy,
+    // and were leaking into the UI — never render one.
+    var isInternalMarker = /^[a-z0-9]+(_[a-z0-9]+)+$/.test(String(escalationNote).trim());
+    if (escalationNote && !isInternalMarker) {
       var note = document.createElement('div');
       note.style.cssText = (
         'font-size:11px; color:#5a8a6a; line-height:1.5; max-width:270px; '
@@ -1415,12 +1500,55 @@ function renderResponse(answer, originalTimestamp = null) {
       .finally(function () { busy = false; });
   }
 
+document.addEventListener('click', function (event) {
+  var clickedElement = event.target.closest(
+    '.essential_annoucement_bar_wrapper a'
+  );
+
+  if (!clickedElement) {
+    return;
+  }
+
+  var buttonText = clickedElement.textContent
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+
+  if (buttonText !== 'cliquez ici') {
+    return;
+  }
+
+  var chatbotToggle = document.getElementById('chatbot-toggle');
+
+  if (!chatbotToggle) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  chatbotToggle.click();
+});
+
+  document.addEventListener('click', function (event) {
+  if (event.target.closest('#open-chatbot-custom')) {
+    var chatbotToggle = document.getElementById('chatbot-toggle');
+
+    if (chatbotToggle) {
+      chatbotToggle.click();
+    }
+  }
+  });
+
   // Streams the reply token-by-token via SSE so the user sees real text
   // arriving in real time instead of waiting for the full response.
   function sendMessageStreaming(text, typingIndicator) {
     var appendDelta = null;
     var gotAnyDelta = false;
     var finalAnswer = null;
+    // Set once the early `products` event has drawn the cards, so the closing
+    // `final` event doesn't draw them a second time.
+    var drewProducts = false;
 
     fetch(API_URL + '/api/chat/send-stream', {
       method: 'POST',
@@ -1456,6 +1584,18 @@ function renderResponse(answer, originalTimestamp = null) {
                 }
                 appendDelta(payload.delta);
               }
+              // Arrives after retrieval but BEFORE the first text delta, so
+              // the perfumes are on screen while the explanation is still
+              // being written. The typing indicator is torn down and
+              // recreated so it reappears UNDER the cards rather than above.
+              if (payload.products && payload.show_products && !drewProducts) {
+                if (payload.products.length) {
+                  removeBotTypingIndicator(typingIndicator);
+                  renderProductCards(payload.products);
+                  drewProducts = true;
+                  if (!gotAnyDelta) typingIndicator = showBotTypingIndicator();
+                }
+              }
               if (payload.final) {
                 finalAnswer = payload.final;
               }
@@ -1467,25 +1607,39 @@ function renderResponse(answer, originalTimestamp = null) {
       })
       .then(function () {
         if (!gotAnyDelta) {
-          // Nothing streamed at all (e.g. proxy buffered the whole response) —
-          // fall back so the user still gets an answer.
           removeBotTypingIndicator(typingIndicator);
+          if (finalAnswer) {
+            // A complete answer arrived without token deltas (proxy buffered
+            // the stream). Render it directly — re-asking would cost a second
+            // API call and, now that cards can be drawn early, would repeat
+            // them.
+            if (finalAnswer.message) addText(finalAnswer.message, 'bot', false, null);
+            renderAnswerExtras(finalAnswer, { skipProducts: drewProducts });
+            maybeBumpCart(finalAnswer);
+            busy = false;
+            return;
+          }
+          // Nothing usable came back at all — fall back so the user still
+          // gets an answer.
           sendMessageNonStreaming(text, null);
           return;
         }
-        if (finalAnswer) renderAnswerExtras(finalAnswer);
+        // The message streamed in as plain text; now that it's complete, swap
+        // in the linked version so URLs and the support phone are clickable.
+        if (appendDelta && appendDelta.finalize) appendDelta.finalize();
+        if (finalAnswer) renderAnswerExtras(finalAnswer, { skipProducts: drewProducts });
         maybeBumpCart(finalAnswer);
         busy = false;
       })
       .catch(function (err) {
         console.warn('[Chatbot] streaming failed, falling back:', err);
-        if (gotAnyDelta) {
-          // Partial text already shown — don't double-send, just stop here.
-          removeBotTypingIndicator(typingIndicator);
+        removeBotTypingIndicator(typingIndicator);
+        if (gotAnyDelta || drewProducts) {
+          // Partial text and/or cards are already on screen — re-sending
+          // would duplicate them, so stop here rather than double-send.
           busy = false;
           return;
         }
-        removeBotTypingIndicator(typingIndicator);
         sendMessageNonStreaming(text, null);
       });
   }

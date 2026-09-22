@@ -6,7 +6,12 @@ import logging
 
 from langchain_openai import ChatOpenAI
 
-from app.rag.constants import POLICY_INTENTS, ChatIntent
+from app.rag.constants import (
+    POLICY_INTENTS,
+    SUPPORT_CONTACT_PATH,
+    SUPPORT_PHONE,
+    ChatIntent,
+)
 from app.rag.intent_classifier import WANTS_DIFFERENT_PRODUCT_RE, classify_intent, intent_to_response_type
 from app.rag.preprocess import preprocess_query
 from app.rag.prompts import OUT_OF_SCOPE_PROMPT, PERFUME_ASSISTANT_PROMPT
@@ -62,7 +67,9 @@ def classify_node(state: ChatGraphState) -> ChatGraphState:
 
 def route_after_classify(state: ChatGraphState) -> str:
     intent = state.get("intent", ChatIntent.GENERAL.value)
-    if intent == ChatIntent.GREETING.value:
+    if intent == ChatIntent.HUMAN_AGENT.value:
+        route = "human_agent"
+    elif intent == ChatIntent.GREETING.value:
         route = "greeting"
     elif intent == ChatIntent.OUT_OF_SCOPE.value:
         route = "out_of_scope"
@@ -93,6 +100,40 @@ def greeting_node(state: ChatGraphState) -> ChatGraphState:
         "detected_intent": ChatIntent.GREETING.value,
     }
     state["pipeline_path"] = "greeting"
+    return state
+
+
+def human_agent_node(state: ChatGraphState) -> ChatGraphState:
+    """Customer asked for a human. Hand over the real contact channels and
+    STOP — no product cards, no recommendations, no LLM call. The reported
+    failure was the bot explaining itself and then continuing to pitch
+    perfumes at someone who had already asked to leave the bot; the contact
+    URL and phone number are emitted verbatim from constants so they can
+    never be paraphrased or invented."""
+    logger.info("[GRAPH] node=human_agent | query=%r", state.get("query"))
+    contact_url = state.get("contact_url", "") or SUPPORT_CONTACT_PATH
+    state["answer"] = {
+        "type": "redirect",
+        "message": (
+            "Bien sûr, notre équipe peut prendre le relais. "
+            f"Vous pouvez nous écrire via notre page de contact : {contact_url} "
+            f"ou nous appeler au {SUPPORT_PHONE}. "
+            "Un conseiller vous répondra dès que possible."
+        ),
+        "products": [],
+        "show_products": False,
+        "show_contact": True,
+        # MUST stay empty: the widget renders escalation_note verbatim under
+        # the Contact button, so an internal marker here shows up to the
+        # customer as raw text ("human_agent_requested"). The pipeline_path
+        # below is the place for machine-readable state.
+        "escalation_note": "",
+        "contact_url": contact_url,
+        "support_phone": SUPPORT_PHONE,
+        "detected_intent": ChatIntent.HUMAN_AGENT.value,
+    }
+    state["shopify_products"] = []
+    state["pipeline_path"] = "human_agent"
     return state
 
 
@@ -230,6 +271,14 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
             state["query"], embed_query_text,
         )
 
+    # "More / other / another" phrasing means the customer wants the NEXT
+    # products, not the ones already on screen — pass everything shown so far
+    # in this thread so a paginated path (brand listing) can skip them.
+    # Only for explicit "more" requests: a fresh, unrelated query must still
+    # be able to return the best products even if it showed them before.
+    wants_more = bool(WANTS_DIFFERENT_PRODUCT_RE.search(state["query"]))
+    exclude_ids = set(state.get("all_shown_shopify_ids") or ()) if wants_more else None
+
     products, intl_ctx, path = resolve_products_for_query(
         db=db,
         query=state["query"],
@@ -240,6 +289,7 @@ def product_search_node(state: ChatGraphState) -> ChatGraphState:
         intent=intent,
         intent_detail=intent_detail,
         embed_query_text=embed_query_text,
+        exclude_shopify_ids=exclude_ids,
     )
 
     # "Recommend me ANOTHER one" must actually surface something the customer
@@ -389,12 +439,22 @@ def build_generate_chain_inputs(state: ChatGraphState) -> dict:
         history_text += f"{m.get('role', 'user')}: {m.get('content', '')[:200]}\n"
 
     # Path-specific response-style guidance (pipeline_path computed above).
-    if pipeline_path in ("intl_sql_match", "intl_pinecone_fallback"):
+    if pipeline_path in ("intl_sql_match", "intl_pinecone_fallback", "intl_curated_match"):
         response_mode_directive = (
-            "Ces produits sont des correspondances de profil olfactif issues de notre collection "
-            "(PAS le parfum international lui-même, qui n'est jamais en vente ici) — présente-les avec une "
-            "formulation naturelle et varie ta phrase, par exemple dans l'esprit de : « Voici quelques parfums "
-            "de notre collection qui correspondent bien au profil olfactif recherché. »"
+            "Ces produits ont été sélectionnés par CORRESPONDANCE DES NOTES OLFACTIVES avec le parfum de "
+            "référence (qui n'est jamais en vente ici). Ancre explicitement ta réponse sur ce critère — "
+            "commence dans l'esprit de « D'après les notes olfactives, ... » — puis cite les notes communes "
+            "réelles (issues du contexte) qui justifient la recommandation. "
+            "N'invente aucun chiffre et n'écris aucun pourcentage : le taux de correspondance est déjà "
+            "affiché sur la fiche produit. Formulation naturelle et variée, jamais une phrase toute faite."
+        )
+    elif pipeline_path == "brand_listing":
+        response_mode_directive = (
+            "Le client demande quels parfums d'une MARQUE donnée nous proposons. Les produits ci-dessous "
+            "sont nos parfums Parfums Star dont le profil olfactif correspond à ceux de cette marque "
+            "(nous ne vendons jamais la marque elle-même). Indique clairement le NOMBRE TOTAL disponible "
+            "précisé dans le contexte, précise que tu n'en montres qu'une partie, et invite le client à "
+            "en demander d'autres. N'affirme JAMAIS que seuls les parfums affichés existent."
         )
     elif state.get("suppress_product_cards"):
         response_mode_directive = (

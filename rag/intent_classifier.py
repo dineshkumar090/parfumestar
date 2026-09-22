@@ -51,6 +51,13 @@ class IntentClassification(BaseModel):
         default=False,
         description="True if the customer explicitly asks for the newest/latest arrivals",
     )
+    is_bestseller_query: bool = Field(
+        default=False,
+        description=(
+            "True if the customer asks for the best / most popular / best-selling "
+            "products ('meilleurs parfums', 'best sellers', 'les plus vendus')"
+        ),
+    )
     skip_product_search: bool = Field(
         default=False,
         description=(
@@ -75,6 +82,9 @@ Intents:
 - own_product_query: produit Parfums Star spécifique (Star n°, STAR n°)
 - store_details, payment_methods, store_information, shipping_policy, contact_information
 - offers_and_rewards, orders, order_management, returns_information, refund_policy, cancellation
+- human_agent: le client veut parler à un humain / conseiller / service client, ou se plaint de ne pas
+  être compris par le bot ("je veux parler à quelqu'un", "un agent", "un conseiller", "service client",
+  "parler à un humain", "talk to an agent", "speak to someone"). PRIORITAIRE sur toute autre intention.
 - greeting: bonjour, salut
 - out_of_scope: sujets hors parfumerie
 - general: autres questions shopping
@@ -92,6 +102,8 @@ Règles:
   liste les 2 noms. Sinon liste vide.
 - needs_ingredient_info=true pour toute question sur allergies, ingrédients, composition, peau sensible.
 - is_newest_query=true pour "nouveautés", "derniers parfums sortis", "dernières sorties", "nouveaux produits".
+- is_bestseller_query=true pour "meilleurs parfums", "les plus vendus", "best sellers", "les plus populaires",
+  "quel est votre meilleur parfum", "top ventes".
 - skip_product_search=true UNIQUEMENT si le client pose une question de suivi sur un parfum DÉJÀ montré/mentionné
   plus haut dans la conversation (regarde "Products currently shown" et l'historique) — ex: "comment l'appliquer ?",
   "combien de temps ça tient ?", "c'est bien pour l'été ?", "quelle est la différence entre EDT et EDP ?",
@@ -192,6 +204,8 @@ def classify_intent(
         result.min_price, result.max_price = min_p, max_p
     if not result.is_newest_query and _heuristic_is_newest(q_lower):
         result.is_newest_query = True
+    if not result.is_bestseller_query and _heuristic_is_bestseller(q_lower):
+        result.is_bestseller_query = True
     if not result.gender_preference:
         # The LLM classifier occasionally leaves gender blank even on an
         # explicit "men's perfume" / "pour homme" style CURRENT message
@@ -200,6 +214,14 @@ def classify_intent(
         # products through. Checked on the current message only (not
         # history) so an earlier turn's gender never leaks into this one.
         result.gender_preference = _heuristic_gender(q_lower)
+    if result.intent != ChatIntent.HUMAN_AGENT.value and HUMAN_AGENT_RE.search(query):
+        # Overrides whatever else was detected: someone asking for a human
+        # must never be answered with product recommendations.
+        logger.info("[INTENT] override: human_agent request detected in %r", query)
+        result.intent = ChatIntent.HUMAN_AGENT.value
+        result.needs_escalation = True
+    if result.intent == ChatIntent.HUMAN_AGENT.value:
+        result.needs_escalation = True
     if result.skip_product_search and WANTS_DIFFERENT_PRODUCT_RE.search(query):
         logger.info(
             "[INTENT] override: skip_product_search forced False — query requests a new/different product: %r",
@@ -267,17 +289,54 @@ def _heuristic_is_newest(q: str) -> bool:
     return any(w in q for w in _NEWEST_WORDS)
 
 
+# "Best / most popular / best-selling" phrasings. Backed by a real, merchant-
+# curated Shopify collection ("PLUS VENDUS"), not by guesswork — see
+# recommendation_pipeline._bestseller_shopify_products.
+_BESTSELLER_WORDS = (
+    "plus vendu", "best seller", "bestseller", "best-seller", "meilleure vente",
+    "meilleures ventes", "populaire", "les plus populaires", "best selling",
+    "best-selling", "top vente", "top ventes", "plus populaire",
+    "meilleur parfum", "meilleurs parfums", "best perfume", "best perfumes",
+    "best fragrance", "votre meilleur", "vos meilleurs",
+)
+
+
+def _heuristic_is_bestseller(q: str) -> bool:
+    return any(w in q for w in _BESTSELLER_WORDS)
+
+
 # A request verb followed (within a short window) by "another/different" —
 # "recommend me another mist", "montre-moi une autre brume" — always means a
 # FRESH product search, never a follow-up question about what's already on
 # screen. Requiring the verb avoids false-triggering on unrelated uses of
 # "autre" (e.g. "the other one you showed" comparing already-shown products,
 # which legitimately IS a follow-up).
+# A request to reach a human. Detected by regex as well as by the LLM
+# because getting this wrong is costly in both directions: a missed request
+# leaves a frustrated customer talking to a bot that keeps pitching
+# products at them (the exact reported complaint), and it must win over the
+# product-search intents that would otherwise claim these phrasings.
+HUMAN_AGENT_RE = re.compile(
+    r"\b(?:parler|discuter|echanger|contacter)\b[^.?!]{0,30}\b"
+    r"(?:humain|personne|quelqu'?un|agent|conseill\w+|vendeur|"
+    r"service\s+client|support|assistance)\b"
+    r"|\b(?:agent|conseiller|service\s+client|service\s+clientele|"
+    r"customer\s+(?:service|support)|human\s+(?:agent|being)|real\s+person|"
+    r"live\s+agent|talk\s+to\s+(?:a\s+)?(?:human|someone|agent|person)|"
+    r"speak\s+to\s+(?:a\s+)?(?:human|someone|agent|person))\b",
+    re.IGNORECASE,
+)
+
 WANTS_DIFFERENT_PRODUCT_RE = re.compile(
-    r"\b(?:recommand\w*|montre\w*|donne\w*|propose\w*|trouve\w*|cherch\w*|"
-    r"show|recommend|suggest|find|give)\b[^.?!]{0,25}\b"
+    r"\b(?:recommand\w*|montre\w*|montrez|donne\w*|donnez|propose\w*|proposez|"
+    r"trouve\w*|cherch\w*|list\w*|voir|avez[\s-]?vous|as[\s-]?tu|"
+    r"show|recommend|suggest|find|give|see)\b[^.?!]{0,25}\b"
     r"(?:un\s+autre|une\s+autre|d'autres?|autres?|quelque\s+chose\s+d'autre|"
-    r"another|a\s+different|something\s+else|other\s+options?)\b",
+    r"another|a\s+different|something\s+else|other\s+options?|"
+    r"more|plus\s+de|encore)\b"
+    # "show me more ABOUT it" / "plus de détails" are follow-up questions
+    # about the product already on screen, not a request for new products.
+    r"(?!\s+(?:about|info\w*|d[ée]tail\w*|sur\s+|concernant))",
     re.IGNORECASE,
 )
 
