@@ -51,6 +51,17 @@ class UnifiedProduct(Base):
     base_note = Column(String(500))
     ingredients = Column(Text)            # raw INCI or note list
 
+    # STANDARDIZED notes — the same values as the raw columns above, run
+    # through services/note_standardizer, stored comma-separated. The
+    # authoritative per-token data lives in `perfume_notes` (one row per
+    # token, which is what matching queries join against); these columns
+    # exist so both sides can be eyeballed and diffed directly in SQL,
+    # which is how note-matching bugs actually get diagnosed.
+    top_note_std = Column(String(1000))
+    heart_note_std = Column(String(1000))
+    base_note_std = Column(String(1000))
+    olfactive_std = Column(String(1000))
+
     # Shopify-specific
     shopify_gid = Column(String(100))
     metafields = Column(JSON)

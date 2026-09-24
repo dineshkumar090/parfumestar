@@ -35,6 +35,15 @@ from app.services.note_matcher import (
 EXACT_TITLE_MATCH_SCORE = 0.9
 EXACT_TITLE_MATCH_MIN_QUERY_LEN = 5
 
+# A hand-curated brand->dupe mapping is trusted ONLY if the two products
+# actually share a fragrance profile. Calibrated on the live catalog over
+# 745 curated pairs vs 2,500 random pairs: a 15% floor rejects 16% of
+# curated links but 48% of random noise, and rejects the demonstrably wrong
+# Carolina Herrera -> "Star n°2510 - Coconut" link (7%, one shared note out
+# of seventeen). Links below it are dropped; those above it are ranked
+# alongside notes-matched candidates (see _rank_curated_and_notes).
+CURATED_MIN_SIMILARITY = 0.15
+
 # Conversational wrapper the customer types around the actual product name —
 # "share me City Pulse parfume" needs to become "City Pulse" before any SQL
 # title match has a chance. Leading command phrases are stripped in a loop
@@ -399,6 +408,50 @@ def _compare_products(
     return combined
 
 
+# Ranking bonus for a hand-curated brand->dupe link (a human confirmed it),
+# applied to ORDERING only — the displayed match % stays the honest score.
+# Sized to win a near-tie, not to overturn a clearly better match: at 0.10 a
+# curated 45% ranks as 55%, still well below a notes-matched 92%.
+CURATED_RANK_BONUS = 0.10
+
+
+def _rank_curated_and_notes(
+    curated: list[dict], note_products: list[dict],
+) -> tuple[list[dict], str | None]:
+    """Pool curated and notes-matched candidates and rank them together.
+
+    Deduplicated by shopify_id; when a product appears in both lists it is
+    marked curated (so it keeps the bonus) with its computed score. Returns
+    (ranked products, origin of the top result: "curated" | "notes" | None)."""
+    pool: dict[str, dict] = {}
+    origin: dict[str, str] = {}
+    for p in note_products:
+        key = str(p.get("shopify_id") or p.get("id") or "")
+        if key:
+            pool[key] = p
+            origin[key] = "notes"
+    for p in curated:
+        key = str(p.get("shopify_id") or p.get("id") or "")
+        if not key:
+            continue
+        if key not in pool or (p.get("score") or 0) >= (pool[key].get("score") or 0):
+            pool[key] = p
+        origin[key] = "curated"
+
+    def rank_key(key: str) -> float:
+        score = pool[key].get("score") or 0.0
+        return score + (CURATED_RANK_BONUS if origin[key] == "curated" else 0.0)
+
+    order = sorted(pool, key=rank_key, reverse=True)
+    if order:
+        logger.info(
+            "[RAG] ranked curated+notes pool | %s",
+            [(origin[k], (pool[k].get("title") or "")[:26], round(pool[k].get("score") or 0, 3))
+             for k in order[:6]],
+        )
+    return [pool[k] for k in order], (origin[order[0]] if order else None)
+
+
 def resolve_products_for_query(
     db: Session,
     query: str,
@@ -695,21 +748,33 @@ def resolve_products_for_query(
     )
 
     logger.info("[RAG] Notes matching started | reference=%r", international.get("title"))
+    curated: list[dict] = []
     intl_row = find_unified_by_pinecone_id(db, international.get("id", ""))
     if intl_row:
-        # Priority 1: the source international DB ships a hand-curated
-        # "these are the exact Shopify dupes" mapping for this product — real
-        # ground truth, not a note-overlap heuristic. Always prefer it when
-        # it names products that are actually active/enabled in this shop's
-        # catalog right now.
+        # Curated links and notes matching are BOTH run, pooled, and ranked
+        # together. Neither is allowed to short-circuit the other.
+        #
+        # Curated links used to win outright whenever they cleared the quality
+        # floor, so notes matching never even ran. Two real, customer-visible
+        # failures came straight from that:
+        #   Agua Fresca de Rosas -> curated "Aromixia" at 45%, while
+        #       "Star.030 - Agua de Rosas" scored 92.5% (all 9 reference notes)
+        #   Diamonds (Armani)    -> curated "Pure Pleasure" at 41%, while
+        #       "Blossom Amour" scored 92.5% and "Brilliant Gem" 84.4%
+        # The curated mapping predates newer products, so it cannot point at
+        # them no matter how good they are. It still earns a ranking bonus —
+        # it IS human-confirmed — enough to win a close call, never enough to
+        # beat a product that simply matches the reference far better.
         curated = shopify_products_from_curated_links(db, intl_row, shop, store_base_url)
-        if curated:
-            logger.info("[RAG] -> intl_curated_match | final products selected: %s", len(curated))
-            return curated[:5], intl_ctx, "intl_curated_match"
+        curated_ok = [p for p in curated if (p.get("score") or 0) >= CURATED_MIN_SIMILARITY]
+        if curated and not curated_ok:
+            logger.info(
+                "[RAG] curated link(s) below quality floor %.0f%% (best=%.0f%%: %r) — dropped",
+                CURATED_MIN_SIMILARITY * 100,
+                max((p.get("score") or 0) for p in curated) * 100,
+                [(p.get("title") or "")[:34] for p in curated],
+            )
 
-        # Priority 2: automated fragrance-note overlap against the Shopify
-        # catalog, for international products with no curated mapping (or
-        # whose curated picks are no longer active/enabled).
         sql_matches = match_shopify_by_sql_notes(
             db, intl_row.id, shop, top_k=10, gender=gender,
             min_price=min_price, max_price=max_price,
@@ -719,13 +784,17 @@ def resolve_products_for_query(
             intl_row.id, len(sql_matches),
             [((r.title or "")[:28], round(s, 3)) for r, s in sql_matches[:5]],
         )
+        note_products: list[dict] = []
         if sql_matches:
-            rows = [r for r, _ in sql_matches]
-            scores = [s for _, s in sql_matches]
-            widget = unified_to_widget_products(db, rows, store_base_url, scores)
-            if widget:
-                logger.info("[RAG] -> intl_sql_match | final products selected: %s", len(widget))
-                return widget, intl_ctx, "intl_sql_match"
+            note_products = unified_to_widget_products(
+                db, [r for r, _ in sql_matches], store_base_url, [s for _, s in sql_matches],
+            )
+
+        ranked, top_origin = _rank_curated_and_notes(curated_ok, note_products)
+        if ranked:
+            path = "intl_curated_match" if top_origin == "curated" else "intl_sql_match"
+            logger.info("[RAG] -> %s | final products selected: %s", path, len(ranked))
+            return ranked[:12], intl_ctx, path
     else:
         logger.info("[RAG] International pinecone id %s not found in main_database — cannot note-match", international.get("id"))
 
@@ -741,6 +810,13 @@ def resolve_products_for_query(
     if fallback_hits:
         logger.info("[RAG] -> intl_pinecone_fallback | candidates returned: %s", min(12, len(fallback_hits)))
         return fallback_hits[:12], intl_ctx, "intl_pinecone_fallback"
+
+    # Last resort: notes matching and the semantic fallback both came up
+    # empty, so a weak curated link is still better than telling the customer
+    # we have nothing for a brand we demonstrably carry.
+    if intl_row is not None and curated:
+        logger.info("[RAG] -> intl_curated_weak | nothing else matched, using below-floor curated link(s)")
+        return curated[:5], intl_ctx, "intl_curated_weak"
 
     logger.info("[RAG] -> intl_no_match | final products selected: 0")
     return [], intl_ctx, "intl_no_match"

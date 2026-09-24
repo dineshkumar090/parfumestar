@@ -20,6 +20,7 @@ from app.services.note_extractor import ExtractedNotes, notes_dict_from_fields
 #  codebase already imports; it is a thin alias for standardize_note.
 # ══════════════════════════════════════════════════════════════════════════
 
+from app.rag.ingredients import split_note_list
 from app.services.note_standardizer import standardize_note
 
 normalize_note_name = standardize_note
@@ -45,11 +46,34 @@ def normalize_gender(raw: str | None) -> str:
     return _GENDER_MAP.get(key, "")
 
 
+def standardize_note_list(raw: str | None) -> str:
+    """'Vanille de Madagascar, Musc blanc' -> 'vanille, musc_blanc'.
+
+    Comma-joined canonical tokens, de-duplicated, order preserved."""
+    if not raw:
+        return ""
+    out: list[str] = []
+    for part in split_note_list(raw):
+        tok = standardize_note(part)
+        if tok and tok not in out:
+            out.append(tok)
+    return ", ".join(out)[:1000]
+
+
 def apply_notes_to_unified(row: UnifiedProduct, notes: ExtractedNotes) -> None:
     row.olfactive = notes.olfactive or row.olfactive
     row.top_note = notes.top_note or row.top_note
     row.heart_note = notes.heart_note or row.heart_note
     row.base_note = notes.base_note or row.base_note
+    # Keep the standardized mirror in step with the raw columns. Without
+    # this a re-sync writes fresh raw notes and leaves *_std stale until the
+    # next app restart runs the backfill — so the two columns would disagree
+    # for however long the process stayed up, which is exactly the kind of
+    # silent drift these columns exist to make visible.
+    row.top_note_std = standardize_note_list(row.top_note)
+    row.heart_note_std = standardize_note_list(row.heart_note)
+    row.base_note_std = standardize_note_list(row.base_note)
+    row.olfactive_std = standardize_note_list(row.olfactive)
     gender = normalize_gender(getattr(notes, "gender", ""))
     if gender:
         row.gender = gender

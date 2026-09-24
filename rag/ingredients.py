@@ -6,13 +6,35 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 
-NOTE_SPLIT_RE = re.compile(r"[,;/|]+")
+# THE single note-list splitter — every other module imports it rather than
+# keeping its own copy (there were five, and they drifted).
+#
+# Splits on punctuation AND on the conjunctions merchants actually write:
+# French descriptions are "Rose, muguet, jasmin et lys", never a clean CSV.
+# Splitting on commas alone fused the last two notes into one token, so
+# "musc et cèdre" became "musc_et_cedre" — a token matching nothing, which
+# silently cost the product BOTH real notes. Measured on the live catalog,
+# that was the final pair of nearly every merchant-written note list.
+#
+# `et`/`and` are matched as whole words only (\b), so "violette" and
+# "bouquet" are never split mid-word.
+NOTE_SPLIT_RE = re.compile(r"\s*(?:[,;/|+·•]|&|\bet\b|\band\b)\s*", re.IGNORECASE)
+
+
+def split_note_list(raw: str | None) -> list[str]:
+    """'Rose, muguet, jasmin et lys.' -> ['Rose', 'muguet', 'jasmin', 'lys.'].
+
+    Returns raw fragments (trimmed, empties dropped); standardization is a
+    separate step."""
+    if not raw:
+        return []
+    return [p.strip() for p in NOTE_SPLIT_RE.split(str(raw)) if p and p.strip()]
 
 
 def _split_notes(raw: str | None) -> list[str]:
     if not raw:
         return []
-    parts = NOTE_SPLIT_RE.split(str(raw))
+    parts = split_note_list(raw)
     notes = []
     for p in parts:
         n = re.sub(r"\s+", " ", p.strip().lower())

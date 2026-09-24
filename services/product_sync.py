@@ -328,6 +328,44 @@ def sync_shopify_products(db: Session, shop: str, store) -> dict:
         result["skipped_unchanged"], result["purged"], result["errors"],
     )
 
+    # Reconcile against Shopify: delete local products that no longer exist
+    # there at all. Without this, a product DELETED and re-created in Shopify
+    # (it gets a NEW shopify_id, same handle) leaves the old row behind
+    # forever — still status='active', so the draft sweep below never
+    # touches it. Measured on the live catalog after a re-sync: 1,086 rows
+    # for 968 real products, i.e. 118 stale duplicates, all of them still
+    # embedded. Search results filled up with the same perfume three times
+    # and pushed genuinely different products out of the top-k.
+    fetched_ids = {str(p.get("id")) for p in shopify_products if p.get("id")}
+    local_count = db.query(Product).filter(Product.shop_url == shop).count()
+    # Safety guard: a partial or rate-limited fetch must never be able to
+    # wipe the catalog. Only reconcile when the fetch plausibly represents
+    # the whole store.
+    if fetched_ids and local_count and len(fetched_ids) >= local_count * 0.5:
+        stale = db.query(Product).filter(
+            Product.shop_url == shop,
+            ~Product.shopify_id.in_([int(i) for i in fetched_ids if i.isdigit()]),
+        ).all()
+        for product in stale:
+            purge_pinecone_ids.append(str(product.id))
+            db.query(UnifiedProduct).filter_by(
+                source_type=SOURCE_SHOPIFY, source_id=str(product.shopify_id)
+            ).delete(synchronize_session=False)
+            db.delete(product)
+            result["purged"] += 1
+        if stale:
+            db.commit()
+            logger.info(
+                "[SYNC] %s: purged %s stale product(s) no longer present in Shopify",
+                shop, len(stale),
+            )
+    elif fetched_ids:
+        logger.warning(
+            "[SYNC] %s: skipping stale-row reconciliation — fetch returned %s products "
+            "against %s local rows, too few to trust as a full catalog",
+            shop, len(fetched_ids), local_count,
+        )
+
     # Defensive sweep: purge any leftover non-active rows already in the DB
     # that weren't in this fetch (e.g. status changed between syncs and the
     # incremental skip above never re-evaluated them).

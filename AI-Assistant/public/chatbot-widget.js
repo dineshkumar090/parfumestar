@@ -981,17 +981,17 @@ function renderResponse(answer, originalTimestamp = null) {
       // could shrink it out of sight — which is why it stopped being visible.
       // Absolute positioning makes it independent of the title length.
       var hasMatch = p.match_percent !== undefined && p.match_percent !== null;
-      // if (hasMatch) {
-      //   var badge = document.createElement('div');
-      //   badge.textContent = String(p.match_percent) + '% match';
-      //   badge.style.cssText =
-      //     'position:absolute; top:6px; left:6px; z-index:2;' +
-      //     'background:' + cfg.windowColor + '; color:#fff;' +
-      //     'font-size:10px; font-weight:800; letter-spacing:.2px;' +
-      //     'padding:3px 7px; border-radius:999px; white-space:nowrap;' +
-      //     'box-shadow:0 1px 4px rgba(0,0,0,.25);';
-      //   imgWrap.appendChild(badge);
-      // }
+      if (hasMatch) {
+        var badge = document.createElement('div');
+        badge.textContent = String(p.match_percent) + '% match';
+        badge.style.cssText =
+          'position:absolute; top:6px; left:6px; z-index:2;' +
+          'background:' + cfg.windowColor + '; color:#fff;' +
+          'font-size:10px; font-weight:800; letter-spacing:.2px;' +
+          'padding:3px 7px; border-radius:999px; white-space:nowrap;' +
+          'box-shadow:0 1px 4px rgba(0,0,0,.25);';
+        imgWrap.appendChild(badge);
+      }
       card.appendChild(imgWrap);
       var body = document.createElement('div');
       body.style.cssText = 'padding:9px 11px 11px' + (isHorizontal ? '; flex:1; min-width:0' : '');

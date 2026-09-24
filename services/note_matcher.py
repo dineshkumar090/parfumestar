@@ -13,20 +13,9 @@ from app.models.perfume_notes import PerfumeNote
 from app.models.products import Product
 from app.rag.constants import SOURCE_INTERNATIONAL, SOURCE_SHOPIFY
 from app.rag.vector_store import BOOST_INTERNATIONAL_NOTES_MATCH, format_product_hit
+from app.services.note_scoring import get_note_idf, score_notes
 
 logger = logging.getLogger("uvicorn.error")
-
-# How much each note category contributes to the overall similarity score.
-# Heart notes define a fragrance's core character and are weighted highest;
-# top notes fade within minutes so they matter less; olfactive family
-# (Floral/Oriental/...) is a coarse but reliable category-level signal.
-_NOTE_TYPE_WEIGHTS: dict[str, float] = {
-    "heart": 0.35,
-    "top": 0.25,
-    "base": 0.25,
-    "olfactive": 0.15,
-}
-
 
 def find_unified_by_pinecone_id(db: Session, pinecone_id: str) -> UnifiedProduct | None:
     logger.info("[NOTES] find_unified_by_pinecone_id(%r)", pinecone_id)
@@ -80,107 +69,28 @@ def _notes_by_type_bulk(db: Session, unified_product_ids: list[int]) -> dict[int
     return grouped
 
 
-# Category (top/heart/base) alignment between two INDEPENDENTLY extracted
-# note lists is inherently unreliable — the international source categorizes
-# notes according to its own data structure, while Shopify's extraction
-# categorizes based on how a merchant happened to write the description.
-# When the same real ingredient lands in "top" on one side and "heart" on
-# the other (or one side's extraction dumps everything into a single
-# bucket), a purely per-category score falsely reports products as
-# dissimilar even when their actual fragrance composition is near-identical.
-# So the FLAT overlap (does this candidate contain roughly the same set of
-# ingredients at all, regardless of which layer either side assigned them
-# to) is the primary, most robust signal; category alignment is kept only
-# as a secondary refinement to reward genuinely correct top/heart/base
-# structure when it IS reliably extracted on both sides.
-_FLAT_WEIGHT = 0.75
-_CATEGORY_WEIGHT = 0.25
-
-# Below this many notes on the smaller side, a full-coverage result is not
-# yet trustworthy: a reference listing only 1-2 notes ("Musc", "Ambre")
-# would otherwise score 100% against any product that happens to contain
-# those two very common notes. Scores are damped toward 0.5x as the smaller
-# set shrinks below this, so a genuinely thin reference reads as "possible
-# match" rather than "perfect match". Sets of this size or larger are never
-# damped at all.
-_MIN_RELIABLE_NOTES = 3
-
-
-def _coverage(a: set[str], b: set[str]) -> tuple[int, int, float]:
-    """Overlap coefficient: |A ∩ B| / min(|A|, |B|).
-
-    Deliberately NOT Jaccard (|A ∩ B| / |A ∪ B|). A Shopify product usually
-    lists far more notes than the international reference it is a dupe of
-    — the real example that motivated this had 8 reference notes against 17
-    Shopify notes, ALL 8 matching. Jaccard scores that 8/17 = 47%, punishing
-    the Shopify product purely for describing itself in more detail, which
-    is not evidence of a worse match. Coverage scores it 8/8 = 100%: every
-    note the reference is known for is present in the candidate.
-
-    Returns (intersection, denominator, score) for transparent logging."""
-    if not a or not b:
-        return 0, 0, 0.0
-    inter = len(a & b)
-    denom = min(len(a), len(b))
-    return inter, denom, (inter / denom) if denom else 0.0
+# Scoring lives in note_scoring.py — IDF-weighted, layer-weighted coverage
+# with taxonomy-aware partial credit. This wrapper is kept because it is the
+# name the rest of the module already calls, and because the two call sites
+# below may or may not have note statistics available.
 
 
 def weighted_note_similarity(
-    ref_by_type: dict[str, set[str]], cand_by_type: dict[str, set[str]],
-) -> tuple[float, dict[str, tuple[int, int, float]]]:
-    """Similarity between two products' notes, blending two coverage signals:
+    ref_by_type: dict[str, set[str]],
+    cand_by_type: dict[str, set[str]],
+    idf: dict[str, float] | None = None,
+    default_idf: float = 1.0,
+) -> tuple[float, dict]:
+    """Similarity between two products' notes, 0-1, plus a breakdown.
 
-    1. FLAT coverage over ALL notes regardless of category — robust to
-       top/heart/base categorization noise between two independently
-       extracted note lists (see module comment above).
-    2. Category-weighted coverage (top/heart/base/olfactive) — a secondary
-       refinement that rewards correct layer structure when present. Note
-       types missing on either side are SKIPPED rather than scored 0: a
-       category absent from one dataset is a data gap, not evidence that the
-       two perfumes differ.
+    Pass `idf` (from note_scoring.get_note_idf) to weight rare notes above
+    ubiquitous ones — without it the comparison still works but treats
+    "osmanthus" and "musc" as equally meaningful, which is what made match
+    percentages unreliable. See note_scoring for the full rationale.
 
-    Matches COMPLETE standardized notes only (set membership — never
-    substring or character-level comparison), so "abricot" can never
-    accidentally match "abri". Returns (overall 0-1 score, breakdown) where
-    breakdown carries the flat and per-category intersection/denominator
-    numbers, for transparent logging of exactly why a score came out as it
-    did."""
-    ref_all = set().union(*ref_by_type.values()) if ref_by_type else set()
-    cand_all = set().union(*cand_by_type.values()) if cand_by_type else set()
-    inter_all, denom_all, flat_score = _coverage(ref_all, cand_all)
-
-    total_weight = 0.0
-    weighted_sum = 0.0
-    breakdown: dict[str, tuple[int, int, float]] = {"_flat": (inter_all, denom_all, flat_score)}
-    for note_type, weight in _NOTE_TYPE_WEIGHTS.items():
-        ref_set = ref_by_type.get(note_type, set())
-        cand_set = cand_by_type.get(note_type, set())
-        if not ref_set or not cand_set:
-            continue
-        inter, denom, cat_score = _coverage(ref_set, cand_set)
-        breakdown[note_type] = (inter, denom, cat_score)
-        total_weight += weight
-        weighted_sum += weight * cat_score
-    category_score = (weighted_sum / total_weight) if total_weight else 0.0
-
-    if denom_all == 0:
-        overall = 0.0
-    elif total_weight == 0:
-        # No usable category breakdown at all (e.g. everything landed in one
-        # untyped bucket) — fall back to the flat score entirely rather than
-        # diluting it with a meaningless 0 category component.
-        overall = flat_score
-    else:
-        overall = _FLAT_WEIGHT * flat_score + _CATEGORY_WEIGHT * category_score
-
-    # Thin-reference damping (see _MIN_RELIABLE_NOTES).
-    if denom_all and denom_all < _MIN_RELIABLE_NOTES:
-        confidence = denom_all / _MIN_RELIABLE_NOTES
-        overall *= 0.5 + 0.5 * confidence
-        breakdown["_damped"] = (denom_all, _MIN_RELIABLE_NOTES, overall)
-
-    breakdown["_overall"] = (inter_all, denom_all, overall)
-    return overall, breakdown
+    Matches COMPLETE standardized tokens only (set membership — never
+    substring), so "abricot" can never accidentally match "abri"."""
+    return score_notes(ref_by_type, cand_by_type, idf, default_idf)
 
 
 def shopify_products_from_curated_links(
@@ -227,14 +137,16 @@ def shopify_products_from_curated_links(
 
     ref_by_type = _notes_by_type(db, intl_row.id)
     cand_notes = _notes_by_type_bulk(db, [r.id for r in rows])
+    idf, default_idf = get_note_idf(db)
     scores = []
     for row in rows:
-        score, breakdown = weighted_note_similarity(ref_by_type, cand_notes.get(row.id, {}))
+        score, breakdown = weighted_note_similarity(
+            ref_by_type, cand_notes.get(row.id, {}), idf, default_idf,
+        )
         scores.append(score)
         logger.info(
-            "[NOTES]   curated #%s %r | notes similarity=%.0f%% breakdown=%s",
-            row.id, (row.title or "")[:40], score * 100,
-            {k: f"{i}/{u}={c:.2f}" for k, (i, u, c) in breakdown.items()},
+            "[NOTES]   curated #%s %r | notes similarity=%.0f%% %s",
+            row.id, (row.title or "")[:40], score * 100, breakdown,
         )
     return unified_to_widget_products(db, rows, store_base_url, scores)
 
@@ -319,9 +231,12 @@ def match_shopify_by_sql_notes(
 
     # ── Phase 2: full-note weighted scoring (Python) ───────────────────
     cand_notes = _notes_by_type_bulk(db, candidate_ids)
+    idf, default_idf = get_note_idf(db)
     scored: list[tuple[int, float, dict]] = []
     for pid in candidate_ids:
-        score, breakdown = weighted_note_similarity(ref_by_type, cand_notes.get(pid, {}))
+        score, breakdown = weighted_note_similarity(
+            ref_by_type, cand_notes.get(pid, {}), idf, default_idf,
+        )
         scored.append((pid, score, breakdown))
     scored.sort(key=lambda x: x[1], reverse=True)
 
@@ -337,8 +252,8 @@ def match_shopify_by_sql_notes(
         if scored:
             pid, score, breakdown = scored[0]
             logger.info(
-                "[NOTES] best candidate #%s still only %.0f%% similar (breakdown=%s) — below floor, no note match returned",
-                pid, score * 100, {k: f"{i}/{u}={c:.2f}" for k, (i, u, c) in breakdown.items()},
+                "[NOTES] best candidate #%s still only %.0f%% similar (%s) — below floor, no note match returned",
+                pid, score * 100, breakdown,
             )
         return []
 
@@ -351,9 +266,8 @@ def match_shopify_by_sql_notes(
         if not row:
             continue
         logger.info(
-            "[NOTES]   shopify #%s %r | similarity=%.0f%% breakdown=%s",
-            pid, (row.title or "")[:40], score * 100,
-            {k: f"{i}/{u}={c:.2f}" for k, (i, u, c) in breakdown.items()},
+            "[NOTES]   shopify #%s %r | similarity=%.0f%% %s",
+            pid, (row.title or "")[:40], score * 100, breakdown,
         )
         results.append((row, score))
     logger.info("[NOTES] match_shopify_by_sql_notes -> %s results", len(results))

@@ -4,6 +4,7 @@ Run on app startup and/or manually via migrations/*.sql
 """
 
 import logging
+
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
@@ -160,6 +161,145 @@ def migrate_utf8mb4(engine: Engine) -> list[str]:
     return converted
 
 
+MAIN_DATABASE_COLUMNS: dict[str, str] = {
+    "top_note_std": "VARCHAR(1000) NULL",
+    "heart_note_std": "VARCHAR(1000) NULL",
+    "base_note_std": "VARCHAR(1000) NULL",
+    "olfactive_std": "VARCHAR(1000) NULL",
+}
+
+
+def migrate_main_database(engine: Engine) -> list[str]:
+    """Add the standardized-note columns alongside the raw ones."""
+    if "main_database" not in inspect(engine).get_table_names():
+        return []
+    existing = _existing_columns(engine, "main_database")
+    added: list[str] = []
+    with engine.begin() as conn:
+        for col, ddl in MAIN_DATABASE_COLUMNS.items():
+            if col in existing:
+                continue
+            conn.execute(text(f"ALTER TABLE main_database ADD COLUMN `{col}` {ddl}"))
+            added.append(col)
+            logger.info("Added column main_database.%s", col)
+    return added
+
+
+def backfill_standardized_notes(engine: Engine) -> int:
+    """Populate main_database.*_std from the raw note columns.
+
+    The authoritative per-token data for MATCHING lives in `perfume_notes`;
+    these columns are the human-readable mirror, so a raw value and what it
+    standardizes to can be compared side by side in a single SELECT. That is
+    how note-matching problems actually get diagnosed — every issue reported
+    so far ("Bois de santal" vs "Santal", "Notes aquatiques" vs "Aquatique")
+    was invisible until both forms could be seen together.
+
+    Idempotent: only rows whose standardized value actually differs are
+    written, so a second run updates nothing."""
+    if "main_database" not in inspect(engine).get_table_names():
+        return 0
+    cols = _existing_columns(engine, "main_database")
+    if not {"top_note_std", "heart_note_std", "base_note_std"} <= cols:
+        return 0
+
+    from app.rag.ingredients import split_note_list
+    from app.services.note_standardizer import standardize_note
+
+    def _std(raw: str | None) -> str:
+        if not raw:
+            return ""
+        seen: list[str] = []
+        for part in split_note_list(raw):
+            tok = standardize_note(part)
+            if tok and tok not in seen:
+                seen.append(tok)
+        return ", ".join(seen)[:1000]
+
+    updates: list[dict] = []
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            "SELECT id, top_note, heart_note, base_note, olfactive, "
+            "       top_note_std, heart_note_std, base_note_std, olfactive_std "
+            "FROM main_database"
+        )).fetchall()
+
+        for rid, top, heart, base, olf, t_s, h_s, b_s, o_s in rows:
+            new = (_std(top), _std(heart), _std(base), _std(olf))
+            if new != ((t_s or ""), (h_s or ""), (b_s or ""), (o_s or "")):
+                updates.append({
+                    "i": rid, "t": new[0], "h": new[1], "b": new[2], "o": new[3],
+                })
+
+        for start in range(0, len(updates), 500):
+            conn.execute(text(
+                "UPDATE main_database SET top_note_std=:t, heart_note_std=:h, "
+                "base_note_std=:b, olfactive_std=:o WHERE id=:i"
+            ), updates[start:start + 500])
+
+    if updates:
+        logger.info(
+            "Backfilled standardized note columns on %s/%s main_database rows",
+            len(updates), len(rows),
+        )
+    return len(updates)
+
+
+def split_fused_perfume_notes(engine: Engine) -> int:
+    """Split perfume_notes rows that actually hold SEVERAL notes.
+
+    Merchant descriptions read "Rose, muguet, jasmin et lys", and the old
+    splitter only cut on commas, so the last pair of nearly every list was
+    stored as one row: "musc et cèdre" -> the token "musc_et_cedre", which
+    matches nothing and cost the product BOTH real notes. 89 such rows across
+    36 products on the live catalog.
+
+    renormalize_perfume_notes cannot fix these — it maps one row to one
+    token. This deletes each fused row and inserts one row per real note,
+    skipping any token the product already has in that layer. Rows are
+    derived data rebuilt from their own preserved `note_raw`, so no Shopify
+    or OpenAI call is involved. Idempotent: the new rows each hold a single
+    fragment, so a second run finds nothing to split."""
+    if "perfume_notes" not in inspect(engine).get_table_names():
+        return 0
+
+    from app.rag.ingredients import split_note_list
+    from app.services.note_standardizer import standardize_note
+
+    split_count = 0
+    with engine.begin() as conn:
+        rows = conn.execute(text(
+            "SELECT id, unified_product_id, source_type, note_type, note_raw "
+            "FROM perfume_notes WHERE note_raw IS NOT NULL"
+        )).fetchall()
+        present = {
+            (pid, nt, nn) for pid, nt, nn in conn.execute(text(
+                "SELECT unified_product_id, note_type, note_name FROM perfume_notes"
+            )).fetchall()
+        }
+
+        for rid, pid, src, nt, raw in rows:
+            parts = split_note_list(raw)
+            if len(parts) <= 1:
+                continue
+            conn.execute(text("DELETE FROM perfume_notes WHERE id = :i"), {"i": rid})
+            for part in parts:
+                tok = standardize_note(part)
+                if not tok or len(tok) < 2 or (pid, nt, tok) in present:
+                    continue
+                conn.execute(text(
+                    "INSERT INTO perfume_notes "
+                    "(unified_product_id, source_type, note_type, note_name, note_raw) "
+                    "VALUES (:p, :s, :t, :n, :r)"
+                ), {"p": pid, "s": src, "t": nt, "n": tok, "r": part[:255]})
+                present.add((pid, nt, tok))
+            split_count += 1
+
+    if split_count:
+        logger.info("Split %s fused perfume_notes row(s) into their individual notes", split_count)
+    return split_count
+
+
 def renormalize_perfume_notes(engine: Engine) -> int:
     """Recompute every stored `perfume_notes.note_name` from its preserved
     `note_raw` original, so an improvement to normalize_note_name applies to
@@ -224,6 +364,10 @@ def run_startup_migrations(engine: Engine) -> None:
         products_changed = migrate_products(engine)
         if products_changed:
             logger.info("Migration complete — products: %s", ", ".join(products_changed))
+
+        main_db_added = migrate_main_database(engine)
+        if main_db_added:
+            logger.info("Migration complete — main_database: %s", ", ".join(main_db_added))
     except Exception as e:
         logger.error("Schema migration failed: %s", e)
         raise
@@ -238,6 +382,16 @@ def run_startup_migrations(engine: Engine) -> None:
     # the app from starting, since the stale note tokens it fixes only degrade
     # match quality rather than breaking the chatbot outright.
     try:
+        split_fused_perfume_notes(engine)
+    except Exception as e:
+        logger.error("splitting fused perfume_notes rows failed: %s", e)
+
+    try:
         renormalize_perfume_notes(engine)
     except Exception as e:
         logger.error("perfume_notes re-normalization failed (matching may use stale tokens): %s", e)
+
+    try:
+        backfill_standardized_notes(engine)
+    except Exception as e:
+        logger.error("standardized note columns backfill failed: %s", e)

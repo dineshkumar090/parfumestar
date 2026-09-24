@@ -77,15 +77,19 @@ def _rebuild_structured_variants(meta: dict) -> list[dict[str, Any]]:
 # note_matcher._coverage). Coverage scoring fixed that pessimism at the
 # source, so a large boost on top is now double-counting.
 #
-# 20 is calibrated against the live catalog, over 1,275 hand-curated
-# international->Shopify dupe pairs vs 2,500 random pairs:
-#   boost   curated shown 100%   random shown 100%
-#     20          24.3%                0.1%
-#     40          34.0%                1.9%
-# i.e. 40 would tell customers that roughly 1 in 50 essentially unrelated
-# products is a perfect match. 20 keeps "100%" meaning something.
+# The notes-match boost is now ZERO. Scoring is coverage of the reference
+# with a complete match reaching 100% on its own, so any boost only
+# saturates the top of the scale: a +20 boost displayed genuinely different
+# matches (raw 100 / 93 / 91 / 91 / 90 for "Agua Fresca de Rosas") as five
+# identical "100%", hiding which product is actually the best dupe — the
+# exact complaint it was meant to address. Honest raw scores are also
+# already well separated (live catalog, 745 curated vs 2,500 random pairs:
+# random pairs reach 90% only 0.1% of the time with no boost at all).
+#
+# The semantic boost is a different scale (cosine similarity, which runs
+# low even for strong matches) and is unaffected.
 BOOST_SHOPIFY_SEMANTIC = 20
-BOOST_INTERNATIONAL_NOTES_MATCH = 20
+BOOST_INTERNATIONAL_NOTES_MATCH = 0
 
 
 def _display_match_percent(score: float | None, boost: int = BOOST_SHOPIFY_SEMANTIC) -> int | None:

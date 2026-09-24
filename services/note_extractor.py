@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from app.rag.ingredients import _split_notes
+from app.rag.ingredients import _split_notes, split_note_list
 
 
 class ExtractedNotes(BaseModel):
@@ -29,12 +29,30 @@ Retourne UNIQUEMENT un JSON valide avec ces clés:
 - base_note: notes de fond séparées par des virgules
 - gender: "femme" si le parfum est pour femme, "homme" si pour homme, "mixte" si unisexe/les deux
 
-Règles:
-- Utilise les noms de notes en français (Bergamote, Jasmin, Musc, Vanille...)
-- Pas de phrases, uniquement des noms de notes séparés par des virgules
-- Si une section est absente, retourne une chaîne vide
-- Déduis le genre du titre, du type de produit et de la description (ex: "Eau de Parfum Femme", "pour homme") ; si vraiment ambigu, réponds "mixte"
-- Format identique à une base de données internationale de parfums de référence"""
+FORMAT DES NOTES (essentiel — ces notes sont comparées automatiquement avec
+une base de parfums de référence, donc la forme doit être CANONIQUE):
+- Un nom de note SIMPLE en français, 1 à 3 mots maximum: "Bergamote", "Jasmin",
+  "Bois de santal", "Fleur d'oranger", "Fève tonka".
+- PAS de qualificatif d'origine: écris "Bergamote", jamais "Bergamote de Calabre";
+  "Citron", jamais "Limone Costa d'Amalfi"; "Cèdre", jamais "Cèdre de Virginie".
+- PAS de préfixe de préparation: écris "Rose", jamais "Teinture de rose" ni
+  "Absolue de rose"; écris "Aquatique", jamais "Notes aquatiques".
+- Au SINGULIER quand c'est naturel: "Note aquatique" -> "Aquatique".
+- Familles olfactives uniquement parmi: Floral, Boisé, Oriental, Ambré, Aromatique,
+  Fruité, Gourmand, Épicé, Agrumes, Chypré, Fougère, Musqué, Frais, Poudré,
+  Marin, Cuir, Vert.
+
+RÈGLES STRICTES:
+- N'INVENTE JAMAIS de notes. Extrais uniquement ce que la description indique
+  réellement. Si la description ne mentionne aucune note olfactive, renvoie des
+  chaînes vides — une extraction inventée corrompt durablement les correspondances.
+- Si le produit n'est PAS un parfum (bougie, diffuseur, savon, cosmétique, coffret)
+  et que la description ne décrit pas de notes olfactives, renvoie tout vide.
+- N'inclus JAMAIS de texte d'emballage ou de spécifications: dimensions, poids,
+  contenance, "durée de combustion", "35 à 40 heures", "180 g", "5 cm".
+- Pas de phrases, uniquement des noms de notes séparés par des virgules.
+- Déduis le genre du titre, du type de produit et de la description (ex: "Eau de
+  Parfum Femme", "pour homme") ; si vraiment ambigu, réponds "mixte"."""
 
 
 def clean_description_html(html: str) -> str:
@@ -55,11 +73,17 @@ def extract_notes_from_description(
         result.gender = _infer_gender_keywords(title, product_type, "")
         return result
 
-    # Try regex first (faster, no API cost) — common French patterns in Parfums Star descriptions
+    # Try regex first (faster, no API cost) — common French patterns in Parfums
+    # Star descriptions. It only short-circuits the LLM when what it captured
+    # actually LOOKS like notes: the pattern grabs everything up to the next
+    # full stop, so on a candle listing it happily returns "durée de combustion
+    # 35 à 40 heures" as a note and — because it returned something — prevented
+    # the LLM from ever producing a real extraction. Those tokens then sat in
+    # the match table forever, matching nothing and diluting every score.
     regex_result = _extract_notes_regex(text)
     if not regex_result.gender:
         regex_result.gender = _infer_gender_keywords(title, product_type, text)
-    if regex_result.top_note or regex_result.heart_note or regex_result.base_note:
+    if _regex_capture_looks_like_notes(regex_result):
         return regex_result
 
     client = OpenAI(api_key=api_key)
@@ -86,6 +110,32 @@ def extract_notes_from_description(
     except Exception as e:
         print(f"[NOTE_EXTRACT] OpenAI failed for {title[:40]}: {e}")
         return regex_result or ExtractedNotes()
+
+
+def _regex_capture_looks_like_notes(result: "ExtractedNotes") -> bool:
+    """Whether a regex capture is trustworthy enough to skip the LLM.
+
+    Requires at least one layer captured AND a majority of the captured
+    tokens to survive the junk filter (no digits, no measurement words, not
+    absurdly long). A candle whose description runs "Notes de tête : ...
+    Dimensions 5 cm, durée de combustion 35 à 40 heures" fails this and
+    falls through to the LLM, which is instructed to return nothing rather
+    than invent notes."""
+    from app.services.note_standardizer import standardize_note
+
+    raw_fields = [result.top_note, result.heart_note, result.base_note]
+    if not any(raw_fields):
+        return False
+
+    tokens: list[str] = []
+    for field in raw_fields:
+        tokens.extend(split_note_list(field))
+    if not tokens:
+        return False
+
+    # standardize_note returns "" for anything the junk filter rejects.
+    usable = sum(1 for t in tokens if standardize_note(t))
+    return usable >= max(1, len(tokens) * 0.6)
 
 
 def _extract_notes_regex(text: str) -> ExtractedNotes:

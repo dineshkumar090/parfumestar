@@ -376,7 +376,16 @@ def standardize_note(raw: str) -> str:
 
     text = _singularize(text)
     text = _apply_vocabulary(text)
-    return text.replace(" ", "_")
+    token = text.replace(" ", "_")
+
+    # Note extraction also runs over candles and gift sets, where it happily
+    # returns "5 cm durée de combustion 35 à 40 heures" as a fragrance note.
+    # Such a token can never match anything, but it WOULD count toward a
+    # coverage denominator and drag every percentage down, so it is rejected
+    # here — at the single point every note passes through.
+    from app.services.note_taxonomy import is_junk_note
+
+    return "" if is_junk_note(token) else token
 
 
 def find_unmapped_tokens(
